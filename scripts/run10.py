@@ -129,7 +129,8 @@ def fail(job_dir: Path, streamer: str, date: str, error: str, detail: str = "",
         text += f"\n{hint}\n"
     text += f"\nלוג: <code>jobs\\{job}_pipeline.log</code>"
     log(f"נכשל: {error} {detail[:120]}")
-    notify(text)
+    # כשל שנוסה שוב לבד (המנטר) - שקט. כשל שדורש אותך - עם רטט.
+    notify(text, important=error not in RETRYABLE)
     sys.exit(1)
 
 
@@ -259,16 +260,14 @@ def streamer_tier(slug: str):
 
 
 def pick(name: str) -> Path:
-    """מוודא שהסקריפט המבוקש קיים, ואם לא - נופל לגרסה קודמת."""
+    """
+    מוודא שהסקריפט המבוקש קיים. בלי נפילה לגרסה ישנה (29.9): גרסה ישנה
+    שרצה בשקט היא מלכודת, והמיון היה שגוי (analyze9 לפני analyze13).
+    """
     p = SCRIPTS / name
     if p.exists():
         return p
-    stem = "".join(ch for ch in name.replace(".py", "") if not ch.isdigit())
-    alts = sorted(SCRIPTS.glob(f"{stem}*.py"), reverse=True)
-    if alts:
-        log(f"לא נמצא {name}, משתמש ב-{alts[0].name}")
-        return alts[0]
-    log(f"לא נמצא {name} ואין חלופה.")
+    log(f"לא נמצא {name}.")
     sys.exit(1)
 
 
@@ -294,10 +293,20 @@ def main() -> None:
     ap.add_argument("--no-wait", action="store_true", help="ניסיון m3u8 אחד בלבד, בלי המתנות")
     ap.add_argument("--no-llm-desc", action="store_true", help="תיאורים מתבנית, בלי עלות")
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--force-vod", action="store_true",
+                    help="להחליף את ה-VOD של עבודה קיימת (בלי זה: עצירה, כדי לא לערבב שני לייבים)")
     ap.add_argument("--analysis", default="auto", choices=["auto", "realtime", "batch"],
                     help="auto = budget.py מחליט (דרמה חמה/גדולים בזמן אמת, השאר batch). "
                          "ידני עוקף את התקציב")
     args = ap.parse_args()
+
+    try:
+        from tg import paused
+        if paused():
+            log(f"המערכת מושהית (/pause מ-{paused().get('since', '?')}). לא מתחיל. /resume בטלגרם.")
+            sys.exit(0)
+    except ImportError:
+        pass
 
     # גודל הסטרימר קובע את הרף ואת עומק הניתוח. דגל מפורש גובר.
     tier, tier_min_score, window, overlap = streamer_tier(args.streamer)
@@ -309,6 +318,17 @@ def main() -> None:
 
     meta_path = job_dir / "meta.json"
     meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+    # 67/1 (29.9): לייב שני באותו יום קיבל את אותה תיקייה, --resume דילג על הכל
+    # (האודיו והתמלול של הראשון כבר שם), ו-vod_url נדרס לכתובת של השני.
+    # המנטר נותן עכשיו תיקייה נפרדת (-2), וכאן השומר לכל מסלול אחר.
+    old_vod = meta.get("vod_url", "")
+    if args.vod and old_vod and old_vod != args.vod and not args.force_vod:
+        log(f"העבודה {job_dir.name} שייכת ל-VOD אחר:\n  קיים: {old_vod}\n  ביקשו: {args.vod}")
+        notify(f"<b>לא הרצתי: {job_dir.name}</b>\n"
+               f"התיקייה שייכת ל-VOD אחר, ולא דורסים לייב אחד בשני.\n"
+               f"קיים: {old_vod}\nביקשו: {args.vod}\n"
+               f"אם זה מכוון: <code>--force-vod</code>", important=True)
+        sys.exit(1)
     if args.vod:
         meta["vod_url"] = args.vod
     if args.display:
@@ -351,7 +371,8 @@ def main() -> None:
             notify(f"<b>קרס: {args.streamer} / {args.date}</b>\n"
                    f"הצינור יצא באמצע שלב {stage}. זה באג, לא תקלה חולפת.\n"
                    f"לוג: <code>jobs\\{args.streamer}_{args.date}_pipeline.log</code>\n"
-                   f"אחרי התיקון: <code>/retry {args.streamer}_{args.date}</code>")
+                   f"אחרי התיקון: <code>/retry {args.streamer}_{args.date}</code>",
+                   important=True)
         except Exception:
             pass
     atexit.register(crash_guard)
@@ -550,6 +571,23 @@ def main() -> None:
             fail(job_dir, args.streamer, args.date, "analyze",
                  detail=f"{ANALYZER} החזיר קוד {rc}")
 
+        # 67/3: חלונות שלא נותחו גם אחרי הניסיונות. הקטעים משאר הלייב ממשיכים.
+        gaps_path = job_dir / "analysis_gaps.json"
+        if gaps_path.exists():
+            try:
+                gaps = json.loads(gaps_path.read_text(encoding="utf-8"))
+            except Exception:
+                gaps = []
+            if gaps:
+                lines = [f"חלון {g.get('window')} מתוך {g.get('of')} ({g.get('span', '')})"
+                         for g in gaps]
+                notify(f"<b>חלק מהלייב לא נותח: {args.display or args.streamer} / {args.date}</b>\n"
+                       + "\n".join(lines) + "\n"
+                       f"סיבה: {str(gaps[0].get('why', ''))[:120]}\n"
+                       "הקטעים משאר הלייב ממשיכים כרגיל.\n"
+                       f"לנתח מחדש הכל: למחוק את <code>audio_segments.json</code> ואז "
+                       f"<code>/retry {job_dir.name}</code>", important=True)
+
     found = json.loads(segments.read_text(encoding="utf-8"))
     good = [s for s in found if s.get("score", 0) >= args.min_score]
     log(f"נמצאו {len(found)} קטעים, {len(good)} מעל ציון {args.min_score} "
@@ -561,6 +599,23 @@ def main() -> None:
         log("עוצר לפני החיתוך (--no-cut).")
     else:
         set_state(job_dir, "cutting", segments=len(found), good=len(good))
+        # 67/4: הכתובת מתחילת הריצה עברה תמלול של שעה-שעתיים ואולי batch של
+        # עד 24 שעות. כתובות של קיק פגות - מביאים טרייה לפני החיתוך.
+        if platform == "kick":
+            fresh, why = "", ""
+            try:
+                from kickurl2 import grab_m3u8_ex
+                log("מביא כתובת m3u8 טרייה לחיתוך...")
+                fresh, why = grab_m3u8_ex(vod)
+            except Exception as exc:
+                why = str(exc)
+            if fresh:
+                m3u8 = fresh
+                meta["m3u8_url"] = fresh
+                meta["m3u8_fetched"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
+            else:
+                log(f"  לא התקבלה כתובת טרייה ({why}), חותך עם הקודמת.")
         log("חותך קטעים...")
         cmd = [sys.executable, pick(CUTTER), "audio_segments.json",
                "--url", m3u8, "--min-score", args.min_score]
@@ -568,9 +623,20 @@ def main() -> None:
             cmd.append("--no-snap")
         rc = run(cmd, cwd=job_dir)
         if rc != 0:
-            notify(f"<b>אזהרה: {args.streamer} / {args.date}</b>\n"
-                   f"החיתוך החזיר קוד {rc}. חלק מהקליפים אולי חסרים.\n"
-                   + HINTS["cut"].format(job=f"{args.streamer}_{args.date}", vod=vod))
+            # 67/4: cut3 יוצא עם 2 כשחלק מהקטעים נכשלו, ורושם אותם
+            missing = []
+            try:
+                missing = json.loads((job_dir / "clips" / "cut_failures.json")
+                                     .read_text(encoding="utf-8"))
+            except Exception:
+                pass
+            what = ("\n".join(f"[{m.get('idx')}] {str(m.get('title', ''))[:50]} - {m.get('why', '')}"
+                              for m in missing)
+                    or "חלק מהקליפים אולי חסרים.")
+            notify(f"<b>חיתוך חלקי: {args.display or args.streamer} / {args.date}</b>\n"
+                   f"{len(missing) or '?'} קטעים לא נחתכו (קוד {rc}):\n{what}\n\n"
+                   + HINTS["cut"].format(job=f"{args.streamer}_{args.date}", vod=vod)
+                   + "\nמה שנחתך ממשיך לאישור.", important=True)
 
     # ---------- 6. תיאורים וקרדיטים ----------
     if not args.no_desc:
@@ -583,7 +649,7 @@ def main() -> None:
         rc = run(desc_cmd, cwd=job_dir)
         if rc != 0:
             notify(f"<b>אזהרה: {args.streamer} / {args.date}</b>\n"
-                   f"describe החזיר קוד {rc}. " + HINTS["describe"])
+                   f"describe החזיר קוד {rc}. " + HINTS["describe"], important=True)
 
     # ---------- 7. תמניילים (משימה 4) ----------
     # לפני האישור, כדי שהתמנייל יגיע לטלגרם יחד עם הקטע ותראה אותו
@@ -608,7 +674,7 @@ def main() -> None:
             # ממשיכים לאישור בלי תמנייל, אבל לא בשקט.
             log(f"שלב התמניילים דולג: {exc}")
             notify(f"<b>אזהרה: {args.streamer} / {args.date}</b>\n"
-                   f"התמניילים דולגו: {exc}\nהקטעים ממשיכים לאישור בלעדיהם.")
+                   f"התמניילים דולגו: {exc}\nהקטעים ממשיכים לאישור בלעדיהם.", important=True)
 
     mins = (time.time() - started) / 60
     clips = sorted(p for p in (job_dir / "clips").glob("*.mp4") if "__p" not in p.stem)
@@ -619,7 +685,7 @@ def main() -> None:
     if not clips and not args.no_cut:
         notify(f"<b>הסתיים בלי קליפים: {args.streamer} / {args.date}</b>\n"
                f"נמצאו {len(found)} קטעים, {len(good)} מעל ציון {args.min_score}, "
-               f"אבל אף קובץ לא נוצר. לבדוק את הלוג.")
+               f"אבל אף קובץ לא נוצר. לבדוק את הלוג.", important=bool(good))
     log(f"קטעים: {job_dir / 'audio_segments.txt'}")
     log(f"וידאו: {job_dir / 'clips'}")
 

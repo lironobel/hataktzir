@@ -23,7 +23,9 @@ upload.py - מעלה קליפ מאושר ליוטיוב, ומפרסם אותו �
     python scripts\\upload.py --thumb jobs\\ronengg_2026-09-10 3   רק תמנייל
 """
 
+import os
 import sys
+import threading
 import json
 import time
 import random
@@ -328,22 +330,77 @@ def metadata(job: Path, idx: int, cfg: dict):
 RETRIABLE = (500, 502, 503, 504)
 
 
+# 67/5 (29.9): נעילה נגד העלאה כפולה. שלושה מסלולים מעלים - ✓ כשהתור ריק,
+# /upload ידני, וחוט התור - ו-youtube.id נכתב רק בסוף ההעלאה. חוט שהתעורר
+# באמצע ראה את הקטע "ממתין" והעלה אותו שוב: שני סרטונים public, מכסה כפולה.
+#   _UPLOAD_LOCK      - בתוך תהליך הבוט: העלאה אחת בכל רגע, והבדיקה אחרי הנעילה.
+#   uploading_at      - בין תהליכים (upload.py ידני, fixclip): סימון בקטע עצמו
+#                       לפני תחילת ההעלאה. ישן מ-UPLOADING_STALE_H = קריסה, מותר שוב.
+_UPLOAD_LOCK = threading.Lock()
+UPLOADING_STALE_H = 3
+
+
+def is_uploading(yt_info: dict, now: datetime = None) -> bool:
+    """הקטע באמצע העלאה עכשיו (בתהליך כלשהו), לפי הסימון בקטע."""
+    raw = (yt_info or {}).get("uploading_at", "")
+    if not raw:
+        return False
+    try:
+        when = datetime.fromisoformat(str(raw))
+    except Exception:
+        return False
+    if not when.tzinfo:
+        when = when.replace(tzinfo=timezone.utc)
+    age_h = ((now or datetime.now(timezone.utc)) - when).total_seconds() / 3600
+    return 0 <= age_h < UPLOADING_STALE_H
+
+
+def clear_uploading(job: Path, idx: int) -> None:
+    path = seg_path(job)
+    segs = load_json(path, [])
+    if not (1 <= idx <= len(segs)):
+        return
+    yt = segs[idx - 1].get("youtube") or {}
+    if "uploading_at" in yt or "uploading_pid" in yt:
+        yt.pop("uploading_at", None)
+        yt.pop("uploading_pid", None)
+        segs[idx - 1]["youtube"] = yt
+        path.write_text(json.dumps(segs, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
 def upload_clip(job, idx: int, privacy: str = "", progress=None) -> dict:
     """
     מעלה קטע אחד. מחזיר dict עם ok / id / url / error.
     `progress` היא פונקציה אופציונלית שמקבלת אחוזים, לדיווח לטלגרם.
+    busy=True = הקטע כבר בהעלאה ממקום אחר. זה לא כישלון ולא נספר.
     """
     job = Path(job)
+    with _UPLOAD_LOCK:
+        # הבדיקה אחרי הנעילה: מי שחיכה לה רואה את ה-id שהקודם כתב
+        seg = get_segment(job, idx)
+        yt_info = seg.get("youtube") or {}
+        already = yt_info.get("id")
+        if already:
+            return {"ok": True, "id": already, "already": True,
+                    "url": f"https://youtu.be/{already}",
+                    "error": ""}
+        if is_uploading(yt_info):
+            return {"ok": False, "busy": True,
+                    "error": f"הקטע כבר בהעלאה (התחיל {yt_info.get('uploading_at')}, "
+                             f"תהליך {yt_info.get('uploading_pid', '?')})"}
+        mark_upload(job, idx, {
+            "uploading_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "uploading_pid": os.getpid()})
+        try:
+            return _upload_clip(job, idx, privacy, progress)
+        finally:
+            clear_uploading(job, idx)
+
+
+def _upload_clip(job: Path, idx: int, privacy: str, progress) -> dict:
     cfg = config()
     if privacy:
         cfg["privacy"] = privacy
-
-    seg = get_segment(job, idx)
-    already = (seg.get("youtube") or {}).get("id")
-    if already:
-        return {"ok": True, "id": already, "already": True,
-                "url": f"https://youtu.be/{already}",
-                "error": ""}
 
     body, path, err = metadata(job, idx, cfg)
     if err:

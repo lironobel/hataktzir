@@ -69,11 +69,15 @@ def audio_duration(path: Path) -> float:
         return 0.0
 
 
-def split_audio(path: Path, chunk_s: int, work_dir: Path) -> list:
-    """חותך לנתחים בלי קידוד מחדש. מחזיר [(קובץ, היסט בשניות), ...]"""
+def split_audio(path: Path, chunk_s: int, work_dir: Path) -> tuple:
+    """
+    חותך לנתחים בלי קידוד מחדש. מחזיר ([(קובץ, היסט בשניות), ...], [היסטים שנכשלו]).
+    67/2 (29.9): נתח ש-ffmpeg לא הצליח לחתוך נעלם עד היום בשקט - שעה חסרה.
+    """
     work_dir.mkdir(exist_ok=True)
     total = audio_duration(path)
     pieces = []
+    missing = []
     idx = 0
     offset = 0.0
     while offset < total:
@@ -87,9 +91,12 @@ def split_audio(path: Path, chunk_s: int, work_dir: Path) -> list:
             )
         if out.exists() and out.stat().st_size > 1000:
             pieces.append((out, offset))
+        elif total - offset > 10:
+            # זנב של שניות בודדות יכול לצאת ריק באמת. יותר מזה - חסר.
+            missing.append(offset)
         idx += 1
         offset += chunk_s
-    return pieces
+    return pieces, missing
 
 
 def transcribe_one(model, pipeline, path: Path, batch: int, beam: int):
@@ -164,13 +171,16 @@ def main() -> None:
 
     if total_s > chunk_s * 1.2:
         print(f"מחלק לנתחים של {args.chunk} דקות...", flush=True)
-        pieces = split_audio(audio_path, chunk_s, work_dir)
+        pieces, missing = split_audio(audio_path, chunk_s, work_dir)
         print(f"{len(pieces)} נתחים.\n", flush=True)
     else:
-        pieces = [(audio_path, 0.0)]
+        pieces, missing = [(audio_path, 0.0)], []
 
     started = time.time()
     rows = []
+    # 67/2: נתח שנכשל = שעה שחסרה בתמלול. עד 29.9 זה היה continue, קוד יציאה 0,
+    # ו-_parts נמחקה - השעה נעלמה לתמיד, והניתוח רץ כאילו כלום.
+    failed = [f"{hms(o)} (החיתוך לנתחים נכשל)" for o in missing]
 
     for i, (piece, offset) in enumerate(pieces, 1):
         label = f"[{i}/{len(pieces)}] {hms(offset)}"
@@ -190,6 +200,7 @@ def main() -> None:
             )
         except Exception as exc:
             print(f"נכשל: {exc}", flush=True)
+            failed.append(f"{hms(offset)} ({str(exc)[:80]})")
             continue
 
         chunk_rows = []
@@ -220,6 +231,13 @@ def main() -> None:
     if not rows:
         print("לא הופק תמלול. לא כותב קבצים.", flush=True)
         sys.exit(1)
+
+    if failed:
+        # לא כותבים תמלול חלקי ולא מוחקים את _parts: הנתחים שהצליחו שמורים
+        # כ-partNNN.json, וניסיון חוזר (המנטר / /retry) מתמלל רק את מה שחסר.
+        print(f"⚠ {len(failed)} נתחים לא תומללו: {', '.join(failed)}", flush=True)
+        print("לא כותב תמלול חלקי. ניסיון חוזר ימשיך מהנתחים שחסרים.", flush=True)
+        sys.exit(3)
 
     rows.sort(key=lambda r: r["start"])
     stem = audio_path.stem

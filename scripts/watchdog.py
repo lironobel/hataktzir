@@ -11,7 +11,7 @@ watchdog.py - שומר חיצוני לניטור. רץ מתזמן המשימות
 והודעה נוספת כשהמנטר חוזר.
 
 התקנה, פעם אחת, בחלון cmd:
-    schtasks /Create /SC MINUTE /MO 30 /TN HataktzirWatchdog /TR "pythonw <PROJECT_DIR>\\scripts\\watchdog.py"
+    schtasks /Create /SC MINUTE /MO 30 /TN HataktzirWatchdog /TR "pythonw C:\\Users\\97253\\Desktop\\Project-clips\\scripts\\watchdog.py"
 בדיקה ידנית:
     python scripts\\watchdog.py --verbose
 הסרה:
@@ -77,7 +77,7 @@ def main() -> None:
             f"הסבב האחרון הסתיים ב-{when} ({age_min/60:.1f} שעות).\n"
             "לייבים לא נקלטים עכשיו.\n\n"
             "1. אם חלון Clips Monitor פתוח - ללחוץ בו Enter (קיפאון QuickEdit).\n"
-            "2. אם אין חלון - להפעיל את start_monitor.bat.")
+            "2. אם אין חלון - להפעיל את start_monitor.bat.", important=True)
         if ok:
             mine = {"alerted": True,
                     "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}

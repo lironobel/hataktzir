@@ -60,6 +60,7 @@ except ImportError:
     raise SystemExit("חסר requests. הרץ:  pip install requests")
 
 from tg import load_config, save_config, notify, call, send_video  # noqa: E402
+from tg import paused, set_paused  # noqa: E402
 
 try:
     from preview import make_compact, clip_for, size_mb
@@ -131,6 +132,10 @@ def reply_status() -> str:
             if state.get(s.get("key") or s.get("slug", ""), {}).get("live")]
 
     lines = ["<b>מצב המערכת</b>", ""]
+    p = paused()
+    if p:
+        lines += [f"⏸ <b>מושהית מ-{p.get('since', '?')}</b> - שום דבר לא רץ. "
+                  "<code>/resume</code> להחזיר.", ""]
 
     # האם המנטר בכלל חי
     fresh = False
@@ -224,6 +229,8 @@ def find_job(name: str):
 
 
 def launch(job: Path) -> str:
+    if paused():
+        return "⏸ המערכת מושהית. קודם <code>/resume</code>, ואז שוב <code>/retry</code>."
     meta = load_json(job / "meta.json", {})
     slug = meta.get("streamer", "")
     vod = meta.get("vod_url", "")
@@ -273,6 +280,33 @@ def seg_title(job: Path, idx: int) -> str:
     if 1 <= idx <= len(segs):
         return segs[idx - 1].get("title", "")
     return ""
+
+
+def clip_brief(job: Path, idx: int) -> str:
+    """
+    29.9 (בקשת לירון): בהודעת "עלה" - של מי, כמה זמן, ועל מה בשתי שורות,
+    כדי לדעת איזה סרטון עלה בלי לפתוח אותו.
+    """
+    job = Path(job)
+    segs = load_json(job / "audio_segments.json", [])
+    seg = segs[idx - 1] if 1 <= idx <= len(segs) else {}
+    desc = next((d for d in load_json(job / "clips" / "descriptions.json", [])
+                 if isinstance(d, dict) and d.get("idx") == idx), {})
+    who = load_json(job / "meta.json", {}).get("display_name", "")
+    mins = desc.get("minutes")
+    if not mins:
+        try:
+            ranges = load_json(job / "clips" / "ranges.json", [])
+            r = next((x for x in ranges if x.get("idx") == idx), None)
+            if r:
+                mins = (sum(b - a for a, b in r.get("ranges", [])) + (r.get("lead") or 0)) / 60
+        except Exception:
+            mins = None
+    about = (seg.get("topic") or seg.get("reason") or "").strip()
+    head = " · ".join(x for x in [who, f"⏱ {float(mins):.0f} דק'" if mins else ""] if x)
+    import html
+    out = (head + ("\n" if head and about else "") + (about[:220] if about else "")).strip()
+    return html.escape(out, quote=False)         # parse_mode=HTML: "<" בנושא שובר את ההודעה
 
 
 def mark_segment(job: Path, idx: int, approved: bool, reason: str = "") -> None:
@@ -327,7 +361,9 @@ def rename_clip_files(job: Path, idx: int, new_title: str) -> list:
     for p in sorted(clips.glob(f"{idx:02d} - *")):
         if p.is_dir():
             continue
-        m = re.search(r"(__p\d+)$", p.stem)
+        # 67/6 (29.9): גם __thumb. עד היום "01 - ישן__thumb.jpg" הפך ל-"01 - חדש.jpg",
+        # thumb.py לא מצא אותו ובנה תמנייל אחר ברגע ההעלאה - תמנייל ידני אבד.
+        m = re.search(r"(__p\d+|__thumb)$", p.stem)
         tail = m.group(1) if m else ""
         target = clips / f"{idx:02d} - {safe_name(new_title)}{tail}{p.suffix}"
         if target == p or target.exists():
@@ -469,6 +505,10 @@ def enqueue(job: Path, idx: int) -> None:
 def do_upload(job: Path, idx: int) -> None:
     """רץ בחוט נפרד. העלאה של קליפ לוקחת דקות, והבוט חייב להמשיך להקשיב."""
     title = seg_title(job, idx)
+    if paused():
+        notify(f"<b>[{idx}] {title[:50]}</b>\n⏸ המערכת מושהית - לא מעלה. "
+               "הקטע נשאר בתור ויעלה אחרי <code>/resume</code>.")
+        return
     if not yt_upload:
         notify(f"[{idx}] {title[:50]} — אושר, אבל ההעלאה לא מוגדרת עדיין.\n"
                "חסר <code>upload.py</code> או ספריות גוגל. ראה YOUTUBE_SETUP.md.")
@@ -488,14 +528,17 @@ def do_upload(job: Path, idx: int) -> None:
     try:
         res = yt_upload.upload_clip(job, idx)
     except Exception as exc:
-        notify(f"<b>[{idx}] {title[:50]}</b>\nההעלאה נפלה:\n<code>{exc}</code>")
+        notify(f"<b>[{idx}] {title[:50]}</b>\nההעלאה נפלה:\n<code>{exc}</code>", important=True)
         log(f"העלאה נפלה: {job.name} [{idx}]: {exc}")
         return
 
+    if res.get("busy"):
+        notify(f"<b>[{idx}] {title[:50]}</b>\nכבר בהעלאה ממקום אחר - לא מעלה פעם שנייה.")
+        return
     if not res.get("ok"):
         notify(f"<b>[{idx}] {title[:50]}</b>\n"
                f"ההעלאה נכשלה:\n<code>{res.get('error','')}</code>\n"
-               f"<code>/upload {job.name} {idx}</code> ינסה שוב.")
+               f"<code>/upload {job.name} {idx}</code> ינסה שוב.", important=True)
         log(f"העלאה נכשלה: {job.name} [{idx}]: {res.get('error','')}")
         return
 
@@ -504,21 +547,25 @@ def do_upload(job: Path, idx: int) -> None:
                buttons=publish_buttons(job.name, idx))
         return
 
-    head = f"<b>[{idx}] {title[:60]}</b>\n{res['url']}"
+    brief = clip_brief(job, idx)
+    head = f"<b>[{idx}] {title[:60]}</b>\n" + (f"{brief}\n" if brief else "") + res['url']
     if res.get("locked"):
         # יוטיוב נעל את הסרטון בסטטוס אחר ממה שביקשנו. זה כמעט תמיד
         # אומר שהפרויקט עוד לא עבר audit, ואז גם כפתור הפרסום ייכשל.
         notify(f"{head}\n\n⚠ ביקשנו <b>{res['asked']}</b> ויוטיוב קבע "
                f"<b>{res['privacy']}</b>.\nזה הסימן שהפרויקט עוד לא עבר audit - "
-               f"ראה YOUTUBE_SETUP.md שלב 8.")
+               f"ראה YOUTUBE_SETUP.md שלב 8.", important=True)
         log(f"הועלה נעול: {job.name} [{idx}] {res['id']}")
         return
 
     thumb = ("" if res.get("thumb_ok")
              else f"\n⚠ תמנייל לא עלה: {res.get('thumb_error','')[:120]}")
-    notify(f"{head}\n\nהסרטון למעלה כ-<b>{res.get('privacy','unlisted')}</b> "
-           f"ועוד לא באוויר. תסתכל עליו, ואם הוא בסדר - לחץ פרסם.{thumb}",
-           buttons=publish_buttons(job.name, idx))
+    if res.get("privacy") == "public":
+        notify(f"{head}\n\nעלה ו<b>באוויר</b>.{thumb}", important=bool(thumb))
+    else:
+        notify(f"{head}\n\nהסרטון למעלה כ-<b>{res.get('privacy','unlisted')}</b> "
+               f"ועוד לא באוויר. תסתכל עליו, ואם הוא בסדר - לחץ פרסם.{thumb}",
+               buttons=publish_buttons(job.name, idx), important=True)
     log(f"הועלה: {job.name} [{idx}] {res['id']}")
 
 
@@ -530,11 +577,11 @@ def do_publish(job: Path, idx: int, chat_id: str, msg: dict) -> None:
     try:
         res = yt_upload.publish(job, idx)
     except Exception as exc:
-        notify(f"<b>[{idx}] {title[:50]}</b>\nהפרסום נפל:\n<code>{exc}</code>")
+        notify(f"<b>[{idx}] {title[:50]}</b>\nהפרסום נפל:\n<code>{exc}</code>", important=True)
         return
     if not res.get("ok"):
         notify(f"<b>[{idx}] {title[:50]}</b>\n"
-               f"הפרסום נכשל:\n<code>{res.get('error','')}</code>")
+               f"הפרסום נכשל:\n<code>{res.get('error','')}</code>", important=True)
         log(f"פרסום נכשל: {job.name} [{idx}]: {res.get('error','')}")
         return
     stamp_message(chat_id, msg, "\n\n🌍 באוויר")
@@ -657,7 +704,8 @@ def queue_loop(stop: threading.Event = None) -> None:
         title = (res.get("title") or "")[:60]
         if res.get("auth"):
             notify(f"<b>⚠ תור ההעלאות מושהה</b>\n{res.get('error','')}\n\n"
-                   f"הקטע [{res['idx']}] {title} לא נספר ככישלון ונשאר ראשון בתור.")
+                   f"הקטע [{res['idx']}] {title} לא נספר ככישלון ונשאר ראשון בתור.",
+                   important=True)
             log("תור: ההרשאה ליוטיוב פגה, התור מושהה")
             continue
         if not res.get("ok"):
@@ -668,7 +716,7 @@ def queue_loop(stop: threading.Event = None) -> None:
                 tail = f"אנסה שוב מאוחר יותר (ניסיון {res.get('fails', 1)})."
             notify(f"<b>[{res['idx']}] {title}</b>\n"
                    f"ההעלאה מהתור נכשלה:\n<code>{res.get('error','')}</code>\n"
-                   f"{tail}")
+                   f"{tail}", important=True)
             log(f"תור: העלאה נכשלה {res['job']} [{res['idx']}]")
             continue
 
@@ -679,11 +727,17 @@ def queue_loop(stop: threading.Event = None) -> None:
         # 25.9: לירון - ✓ הוא האישור היחיד. youtube.json privacy=public,
         # ואז הסרטון באוויר מיד ואין כפתור פרסום.
         live = res.get("privacy") == "public"
-        notify(f"<b>[{res['idx']}] {title}</b>\n{res['url']}\n\n"
+        try:
+            brief = clip_brief(ROOT / "jobs" / res["job"], res["idx"])
+        except Exception:
+            brief = ""
+        notify(f"<b>[{res['idx']}] {title}</b>\n" + (f"{brief}\n" if brief else "")
+               + f"{res['url']}\n\n"
                + (f"עלה מהתור ו<b>באוויר</b>.{thumb}{tail}" if live else
                   f"עלה מהתור כ-<b>{res.get('privacy','unlisted')}</b> "
                   f"ועוד לא באוויר.{thumb}{tail}"),
-               buttons=None if live else publish_buttons(res["job"], res["idx"]))
+               buttons=None if live else publish_buttons(res["job"], res["idx"]),
+               important=not live or bool(thumb))
         log(f"תור: הועלה {res['job']} [{res['idx']}] {res.get('id','')}")
 
 
@@ -730,7 +784,7 @@ def reminder_loop(stop: threading.Event = None) -> None:
             lines.append(f"[{w['idx']}] {w['title'][:55]}\n{w['url']}")
         lines.append("")
         lines.append("<code>/unlisted</code> מראה את הרשימה המלאה עם כפתורים.")
-        notify("\n".join(lines))
+        notify("\n".join(lines), important=True)
 
 
 def handle_callback(cb: dict) -> None:
@@ -1338,6 +1392,98 @@ def reply_logs(arg: str = "") -> str:
     return f"<b>{job.name}</b> — 30 שורות אחרונות\n<pre>{body[:3500]}</pre>"
 
 
+def running_pipelines() -> list:
+    """עבודות שיש להן תהליך צינור חי עכשיו: [(תיקייה, pid)]."""
+    out = []
+    for pid_file in sorted((ROOT / "jobs").glob("*/pipeline.pid")):
+        try:
+            pid = int(pid_file.read_text(encoding="utf-8").strip())
+        except Exception:
+            continue
+        alive = False
+        if os.name == "nt":
+            try:
+                r = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                                   capture_output=True, text=True, timeout=15)
+                alive = str(pid) in (r.stdout or "")
+            except Exception:
+                alive = False
+        else:
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except OSError:
+                alive = False
+        if alive:
+            out.append((pid_file.parent, pid))
+    return out
+
+
+def kill_tree(pid: int) -> bool:
+    """הורג את הצינור וכל תהליכי הבת שלו (תמלול, ffmpeg, yt-dlp)."""
+    try:
+        if os.name == "nt":
+            r = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                               capture_output=True, text=True, timeout=30)
+            return r.returncode == 0
+        import signal
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        return True
+    except Exception as exc:
+        log(f"לא הצלחתי לעצור את {pid}: {exc}")
+        return False
+
+
+def reply_pause(arg: str = "") -> str:
+    """
+    עצירת חירום (29.9, בקשת לירון): כשרואים תקלה עמוקה - לעצור הכל.
+    המנטר מפסיק לבדוק ולהפעיל, התור מפסיק להעלות, והצינורות שרצים עכשיו
+    נעצרים. עבודה שנעצרה מסומנת "נכשלה - ניתן לנסות שוב", כך שאחרי
+    /resume המנטר ימשיך אותה מהשלב שבו עצרה (התמלול שומר נתחים).
+    """
+    already = paused()
+    set_paused(True, why=arg or "")
+    stopped = []
+    for job, pid in running_pipelines():
+        if kill_tree(pid):
+            st = load_json(job / "state.json", {})
+            stage = st.get("stage", "?")
+            st.update(stage="failed", error="paused", retryable=True,
+                      detail=f"נעצר ב-/pause בשלב {stage}", _failed_reported=True,
+                      updated=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+            (job / "state.json").write_text(json.dumps(st, ensure_ascii=False, indent=1),
+                                            encoding="utf-8")
+            (job / "pipeline.pid").unlink(missing_ok=True)
+            stopped.append(f"{job.name} (בשלב {stage})")
+    log(f"/pause: המערכת מושהית. נעצרו: {stopped or 'אין'}")
+    head = "⏸ <b>הכל מושהה</b>" + (" (כבר היה)" if already else "")
+    lines = [head, "",
+             "• המנטר לא בודק לייבים ולא מפעיל עבודות",
+             "• התור לא מעלה ליוטיוב (גם ✓ ו-/upload)",
+             "• הבוט עצמו ממשיך לענות - אפשר לאשר, לבדוק, לקרוא לוגים",
+             "• נשאר גם אחרי הפעלה מחדש של המחשב"]
+    if stopped:
+        lines += ["", "<b>נעצרו באמצע:</b>"] + [f"• {x}" for x in stopped]
+        lines.append("ימשיכו מאותו שלב אחרי /resume.")
+    else:
+        lines += ["", "לא רץ אף צינור ברגע זה."]
+    lines += ["", "<code>/resume</code> מחזיר הכל לפעולה."]
+    return "\n".join(lines)
+
+
+def reply_resume(arg: str = "") -> str:
+    p = paused()
+    if not p:
+        return "▶ המערכת לא מושהית - הכל רץ."
+    set_paused(False)
+    log("/resume: המערכת חזרה לפעולה")
+    waiting = sum(1 for j in (ROOT / "jobs").glob("*/state.json")
+                  if load_json(j, {}).get("error") == "paused")
+    return ("▶ <b>חזרנו לפעולה</b> (הייתה מושהית מ-" + str(p.get("since", "?")) + ")\n"
+            "המנטר יבדוק בסבב הבא (עד 5 דק'), התור ימשיך כרגיל."
+            + (f"\n{waiting} עבודות שנעצרו ימשיכו לבד תוך כחצי שעה (או מיד: /retry שם)." if waiting else ""))
+
+
 def reply_help() -> str:
     return (
         "<b>מה אפשר לשאול אותי</b>\n\n"
@@ -1350,7 +1496,9 @@ def reply_help() -> str:
         "<b>/jobs</b> — העבודות האחרונות\n"
         "<b>/failed</b> — מה נכשל ולמה\n"
         "<b>/retry שם</b> — להפעיל עבודה מחדש\n"
-        "<b>/logs שם</b> — 30 השורות האחרונות בלוג\n\n"
+        "<b>/logs שם</b> — 30 השורות האחרונות בלוג\n"
+        "<b>/pause</b> — ⏸ עצירת חירום: מנטר, צינורות ותור\n"
+        "<b>/resume</b> — ▶ להחזיר הכל לפעולה\n\n"
         "<b>יוטיוב</b>\n"
         "<b>/queue</b> — תור ההעלאות ומתי כל אחד יעלה\n"
         "<b>/budget</b> — כמה הוצאנו החודש, והאם התקציב עוצר את הערוץ\n"
@@ -1391,6 +1539,9 @@ ARG_ROUTES = [
 ]
 
 ROUTES = [
+    # עצירת חירום - ראשונה, ובלי מילים קצרות שיופיעו סתם במשפט
+    (("pause", "עצור הכל", "עצור הכול", "השהה הכל", "תעצור הכל"), reply_pause),
+    (("resume", "המשך הכל", "תמשיך הכל", "חזור לפעולה"), reply_resume),
     (("queue", "תור", "מה בתור", "תור ההעלאות", "מתי יעלה",
       "מה מחכה להעלאה"), reply_queue),
     (("budget", "תקציב", "כמה הוצאנו", "כמה עלה", "הוצאות"), reply_budget),
@@ -1525,6 +1676,8 @@ def handle(update: dict) -> None:
 
 MENU_COMMANDS = [
     ("status",  "מה קורה עכשיו"),
+    ("pause",   "⏸ עצירת חירום - עוצר הכל"),
+    ("resume",  "▶ להחזיר הכל לפעולה"),
     ("pending", "מה ממתין לאישור שלך"),
     ("resend",  "לשלוח שוב את הקטעים הפתוחים"),
     ("queue",   "תור ההעלאות ומתי כל אחד יעלה"),

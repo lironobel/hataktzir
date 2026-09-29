@@ -49,6 +49,11 @@ except ImportError:
     def notify(text, **kw):
         print(f"[טלגרם לא זמין] {text}")
         return False
+try:
+    from tg import paused
+except ImportError:
+    def paused():
+        return {}
 
 
 STATE_PATH = ROOT / "monitor_state.json"
@@ -174,9 +179,65 @@ def newest_vod(entry: dict) -> dict:
     return vods[0] if vods else {}
 
 
+OFFLINE_CONFIRM = 2          # בדיקות "לא משדר" רצופות לפני שמכריזים על סיום (67/8)
+CHECK_ERRORS_ALERT = 6       # בדיקות שנכשלו ברצף (~30 דק') בזמן לייב = הודעה
+
+
+def pending_candidate(cur: dict, entry: dict, is_live: bool) -> dict:
+    """
+    ה-VOD שמחכה לעיבוד. בדרך כלל החדש ביותר.
+
+    67/8: כשהסטרימר חזר לשדר לפני שה-VOD של הלייב הקודם עובד (לייב שקרס
+    וחזר), ה-VOD החדש ביותר ברשימה עלול להיות הלייב שרץ עכשיו. אז מעבדים
+    רק VOD שהתחיל לפני שהלייב הנוכחי עלה, ובלי תאריך התחלה - מחכים לסיום.
+    """
+    vods = cur.get("vods") or []
+    if not is_live:
+        return vods[0] if vods else {}
+    went = entry.get("went_live", "")
+    try:
+        went_t = datetime.fromisoformat(went)
+    except Exception:
+        return {}
+    for v in vods:
+        if v.get("id") == entry.get("last_processed_vod"):
+            return {}
+        try:
+            st = datetime.fromisoformat(str(v.get("start", "")).replace("Z", "+00:00"))
+            if st.tzinfo is None:
+                st = st.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        if (went_t - st).total_seconds() > 120:
+            return v
+    return {}
+
+
+def job_date_for(slug: str, vod_url: str, day: str = "") -> str:
+    """
+    ה"תאריך" של תיקיית העבודה ללייב הזה: YYYY-MM-DD, ואם כבר יש תיקייה של
+    הסטרימר מהיום עם VOD אחר - YYYY-MM-DD-2, -3 וכו'.
+
+    67/1 (29.9): עד היום לייב שני באותו יום (או לייב שקרס וחזר - נפוץ בקיק)
+    קיבל את אותה תיקייה. --resume מצא את האודיו והתמלול של הראשון ודילג על
+    הכל, והשני פשוט לא נותח. ובנוסף vod_url נדרס לכתובת של השני.
+    אותו VOD = אותה תיקייה (ניסיון חוזר ממשיך מהמקום).
+    """
+    day = day or datetime.now().strftime("%Y-%m-%d")
+    for n in range(1, 20):
+        date = day if n == 1 else f"{day}-{n}"
+        job = ROOT / "jobs" / f"{slug}_{date}"
+        if not job.exists():
+            return date
+        old = load_json(job / "meta.json", {}).get("vod_url", "")
+        if not old or old == vod_url:
+            return date
+    return f"{day}-{datetime.now().strftime('%H%M')}"
+
+
 def launch_pipeline(slug: str, display: str, vod_url: str, dry: bool, m3u8: str = "") -> None:
     """מפעיל את run10.py ברקע. לא חוסם את הלולאה."""
-    date = datetime.now().strftime("%Y-%m-%d")
+    date = job_date_for(slug, vod_url)
     cmd = [
         sys.executable, str(SCRIPTS / "run10.py"),
         slug, date,
@@ -188,12 +249,13 @@ def launch_pipeline(slug: str, display: str, vod_url: str, dry: bool, m3u8: str 
         log(f"[יבש] הייתי מריץ: {' '.join(cmd[-6:])}")
         return
 
-    log(f"מפעיל את הצינור על {slug}")
+    log(f"מפעיל את הצינור על {slug} ({slug}_{date})")
     run_job(slug, date, vod_url, display, "התחלה", m3u8=m3u8)
 
+    extra = f"\n(לייב נוסף מהיום - תיקייה {slug}_{date})" if date.count("-") > 2 else ""
     notify(
         f"<b>מתחיל לעבד את הלייב של {display}</b>\n"
-        f"זה ייקח בערך שעתיים. אעדכן כשיהיו קטעים."
+        f"זה ייקח בערך שעתיים. אעדכן כשיהיו קטעים.{extra}"
     )
 
 
@@ -221,6 +283,8 @@ def report_finished(slug: str, display: str) -> bool:
     # שולח כל קטע עם כפתורי אישור/דחייה. לחיצה מלמדת את המנתח.
     try:
         from approve2 import send_for_approval
+        # 67/7: approve2 שולח רק קטעים שיש להם קובץ וידאו (קטע שלא נחתך
+        # מגיע לאישור בלי סרטון, ו-✓ עליו נכשל 3 פעמים ויוצא מהתור).
         sent = send_for_approval(job)
         if not sent:
             notify(f"<b>{display}: העבודה הסתיימה</b>\nאין קטעים חדשים שממתינים לאישור.")
@@ -230,7 +294,7 @@ def report_finished(slug: str, display: str) -> bool:
         lines = [f"<b>הקטעים של {display} מוכנים</b>", ""]
         for i, s in enumerate(segs[:8], 1):
             lines.append(f"<b>{s.get('score','?')}/10</b>  {s.get('title','')}")
-        notify("\n".join(lines))
+        notify("\n".join(lines), important=True)
 
     state["_reported"] = True
     save_json(job / "state.json", state)
@@ -331,7 +395,7 @@ def tend_failed_jobs(dry: bool = False) -> None:
                          detail=f"נתקע בשלב {stage} במשך {age_min/60:.0f} שעות")
             save_json(job / "state.json", state)
             notify(f"<b>נתקע: {display} / {date}</b>\nבשלב {stage} כבר {age_min/60:.0f} שעות. "
-                   f"מסמן ככישלון וינסה שוב.")
+                   f"מסמן ככישלון וינסה שוב.", important=True)
             log(f"{job.name} נתקע בשלב {stage}")
 
         if stage != "failed":
@@ -341,7 +405,8 @@ def tend_failed_jobs(dry: bool = False) -> None:
         if not state.get("notified") and not state.get("_failed_reported"):
             notify(f"<b>נכשל: {display} / {date}</b>\n"
                    f"שגיאה: {state.get('error','?')}\n{state.get('detail','')}\n"
-                   f"לוג: <code>jobs\\{job.name}_pipeline.log</code>")
+                   f"לוג: <code>jobs\\{job.name}_pipeline.log</code>",
+                   important=not state.get("retryable"))
             state["_failed_reported"] = True
             save_json(job / "state.json", state)
 
@@ -358,7 +423,7 @@ def tend_failed_jobs(dry: bool = False) -> None:
             if not state.get("_gave_up"):
                 notify(f"<b>ויתרתי: {display} / {date}</b>\n"
                        f"{retries} ניסיונות נכשלו ({state.get('error')}). "
-                       f"<code>/retry {job.name}</code> ינסה ידנית.")
+                       f"<code>/retry {job.name}</code> ינסה ידנית.", important=True)
                 state["_gave_up"] = True
                 save_json(job / "state.json", state)
             continue
@@ -436,6 +501,14 @@ def tend_budget_waiting(dry: bool = False) -> None:
 
 
 def one_round(dry: bool = False) -> None:
+    p = paused()
+    if p:
+        # עצירת חירום (/pause). לא בודקים, לא מפעילים, לא מנסים שוב. רק "נוגעים"
+        # ב-monitor_state.json כדי שה-watchdog לא יחשוב שהמנטר קפא.
+        log(f"מושהה מ-{p.get('since', '?')} (/resume בטלגרם). לא עושה כלום.")
+        state = load_json(STATE_PATH, {})
+        save_json(STATE_PATH, state)
+        return
     streamers = active_streamers()
     if not streamers:
         log("אין סטרימרים פעילים ב-watchlist.json")
@@ -463,11 +536,52 @@ def one_round(dry: bool = False) -> None:
 
         was_live = bool(prev.get("live"))
         is_live = bool(cur.get("live"))
-
         entry = dict(prev)
+
+        # 67/8 (29.9): "הבדיקה נכשלה" ≠ "סיים לשדר". livecheck מחזיר live=False
+        # גם כשקיק/יוטיוב לא נקראו (עם error), והמנטר הכריז "X סיים לשדר"
+        # והתחיל לחפש VOD באמצע לייב. עכשיו:
+        #   1. בדיקה עם שגיאה לא משנה את המצב - נשאר מה שהיה.
+        #   2. גם "לא משדר" נקי צריך להופיע בשתי בדיקות רצופות (~5 דק')
+        #      לפני שמכריזים על סיום. נפילה של דקה ברשת לא נחשבת סיום.
+        #   3. אם הבדיקה נכשלת ברצף בזמן שהוא משדר - הודעה (עם רטט).
+        err = cur.get("error") if not is_live else ""
+        if err:
+            n_err = int(prev.get("check_errors", 0)) + 1
+            entry["check_errors"] = n_err
+            entry["checked"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            if n_err == 1 or n_err % 12 == 0:
+                log(f"{display}: הבדיקה נכשלה ({str(err)[:80]}) - לא משנה מצב")
+            if was_live and n_err == CHECK_ERRORS_ALERT:
+                notify(f"<b>לא מצליח לבדוק את {display}</b>\n"
+                       f"{n_err} בדיקות רצופות נכשלו ({str(err)[:100]}).\n"
+                       "הוא היה בלייב. לא מכריז על סיום עד שהבדיקה תעבוד.",
+                       important=True)
+            if not entry.get("pending_vod"):
+                state[key] = entry
+                try:
+                    report_finished(slug, display)
+                except Exception:
+                    pass
+                continue
+            is_live = was_live          # ממשיכים רק לטיפול ב-VOD שכבר ממתין
+        else:
+            if prev.get("check_errors", 0) >= CHECK_ERRORS_ALERT and was_live:
+                notify(f"✓ הבדיקה של {display} חזרה לעבוד.")
+            entry.pop("check_errors", None)
+
+        if was_live and not is_live:
+            n_off = int(prev.get("offline_seen", 0)) + 1
+            if n_off < OFFLINE_CONFIRM:
+                entry["offline_seen"] = n_off
+                log(f"{display}: לא משדר בבדיקה {n_off}/{OFFLINE_CONFIRM} - מוודא בסבב הבא")
+                is_live = True          # עדיין לא מכריזים
+        else:
+            entry.pop("offline_seen", None)
+
         entry["live"] = is_live
         entry["checked"] = now
-        if is_live:
+        if is_live and cur.get("live"):
             entry["title"] = cur.get("title", "")
             entry["viewers"] = cur.get("viewers", 0)
             entry.setdefault("went_live", now)
@@ -475,11 +589,13 @@ def one_round(dry: bool = False) -> None:
         # עלה לשידור
         if is_live and not was_live:
             log(f"{display} עלה ללייב")
+            back = entry.get("pending_vod")
             notify(
                 f"<b>{display} עלה ללייב</b>\n"
                 f"{cur.get('title','')}\n"
                 f"{cur.get('viewers',0)} צופים\n"
                 f"{cur.get('url') or 'https://kick.com/' + slug}"
+                + ("\n(חזר אחרי הפסקה. הלייב הקודם יעובד בנפרד.)" if back else "")
             )
             entry["went_live"] = now
 
@@ -493,7 +609,7 @@ def one_round(dry: bool = False) -> None:
 
         # ממתין ל-VOD
         if entry.get("pending_vod"):
-            vod = newest_vod(cur)
+            vod = pending_candidate(cur, entry, is_live)
             ended = entry.get("ended")
             waited = 0
             if ended:
@@ -537,7 +653,7 @@ def one_round(dry: bool = False) -> None:
 
             elif waited > cfg["vod_wait"] * 3:
                 log(f"לא נמצא VOD ל-{display} אחרי {waited:.0f} דקות. מוותר.")
-                notify(f"לא נמצא VOD ל-{display} אחרי {waited:.0f} דקות.")
+                notify(f"לא נמצא VOD ל-{display} אחרי {waited:.0f} דקות.", important=True)
                 entry["pending_vod"] = False
                 entry.pop("ended", None)
 
@@ -611,7 +727,10 @@ def main() -> None:
                "אפשר לכתוב לי <b>/status</b> או <b>/health</b> בכל רגע.")
 
     try:
-        resume_stuck_jobs(dry=args.dry)
+        if paused():
+            log("מושהה - לא ממשיך עבודות שנתקעו עד /resume.")
+        else:
+            resume_stuck_jobs(dry=args.dry)
     except Exception:
         log("בדיקת עבודות תקועות נכשלה:")
         traceback.print_exc()

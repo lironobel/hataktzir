@@ -389,7 +389,9 @@ def hms(seconds: float) -> str:
 
 
 def to_seconds(t: str) -> int:
-    parts = [int(x) for x in t.strip().split(":")]
+    # 67/12 (29.9): int(float()) ולא int() - "01:02:03.5" מהמודל הפיל את כל
+    # הניתוח אחרי שכבר שולם. ערך לא תקין עדיין זורק ValueError - valid_segments מסנן.
+    parts = [int(float(x)) for x in str(t).strip().split(":")]
     while len(parts) < 3:
         parts.insert(0, 0)
     return parts[0] * 3600 + parts[1] * 60 + parts[2]
@@ -434,22 +436,58 @@ def response_text(resp) -> str:
     return "\n".join(parts)
 
 
-def extract_json(text: str) -> dict:
-    """המודל אמור להחזיר JSON נקי, אבל לפעמים עוטף אותו. מחלץ בכל מקרה."""
-    text = text.strip()
+def extract_json_ok(text: str):
+    """
+    (נתונים, הצליח). המודל אמור להחזיר JSON נקי, אבל לפעמים עוטף אותו.
+    הצליח=False כשאין JSON תקין בכלל - תשובה ריקה או קטועה. זה לא "אין קטעים",
+    וחייב להיות מובחן ממנו (67/3, 29.9).
+    """
+    text = (text or "").strip()
     text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.MULTILINE).strip()
     try:
-        return json.loads(text)
+        data = json.loads(text)
+        return (data if isinstance(data, dict) else {"segments": []}), isinstance(data, dict)
     except json.JSONDecodeError:
         pass
     start = text.find("{")
     end = text.rfind("}")
     if start >= 0 and end > start:
         try:
-            return json.loads(text[start:end + 1])
+            data = json.loads(text[start:end + 1])
+            if isinstance(data, dict):
+                return data, True
         except json.JSONDecodeError:
             pass
-    return {"segments": []}
+    return {"segments": []}, False
+
+
+def extract_json(text: str) -> dict:
+    """כמו extract_json_ok, בלי הדגל. לשלב א' ולכלים אחרים."""
+    return extract_json_ok(text)[0]
+
+
+def valid_segments(found, window: int = 0) -> list:
+    """
+    67/12: קטע בלי start/end, או עם זמן שאי אפשר לקרוא, נזרק כאן - לפני
+    merge_segments, שם הוא היה מפיל את כל הריצה אחרי שכבר שולם על כל החלונות.
+    window = מספר החלון, נשמר בקטע (merge_segments משתמש בו - 67/9).
+    """
+    out = []
+    for seg in found if isinstance(found, list) else []:
+        if not isinstance(seg, dict):
+            continue
+        try:
+            a, b = to_seconds(seg["start"]), to_seconds(seg["end"])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            print(f"  ⚠ קטע עם זמן לא תקין נזרק: {str(seg.get('title', ''))[:50]}")
+            continue
+        if b <= a:
+            print(f"  ⚠ קטע שנגמר לפני שהתחיל נזרק: {str(seg.get('title', ''))[:50]}")
+            continue
+        if window:
+            seg["window"] = window
+        out.append(seg)
+    return out
 
 
 def load_profile(root: Path, slug: str) -> dict:
@@ -801,6 +839,37 @@ def merge_parts(keep: list, other: list, join: int = 1) -> list:
     return [(a, b) for a, b in out]
 
 
+STAGE_B_RETRY_WAITS = [0, 30, 120, 300]   # ניסיון ראשון מיד, אחר כך המתנות (67/3)
+SAME_CONTEXT_OVERLAP = 30   # שניות חפיפה בין קטעים מחלונות שונים = אותה שיחה
+
+
+def same_context(last: dict, seg: dict, gap_tolerance: int = 90) -> bool:
+    """
+    67/9 (החלטת לירון 28.9): לאחד רק כשזה אותו הקשר - אותה שיחה שחלון אחר
+    ראה - גם אם יש פער. שני קטעים שונים שסמוכים זה לזה - לא לאחד.
+
+    אותו הקשר:
+      - כפילות: חופפים בחצי מהקצר מביניהם או יותר (גם מאותו חלון).
+      - מחלונות שונים, וגם חפיפה ממשית (30 שנ'+) או cut_off באחד מהם
+        (המודל אמר "הסיפור ממשיך מעבר לקצה") עם פער עד gap_tolerance.
+    קטעים מאותו חלון שלא חופפים - המודל פיצל אותם בכוונה. נפרדים.
+    """
+    a1, b1 = to_seconds(last["start"]), to_seconds(last["end"])
+    a2, b2 = to_seconds(seg["start"]), to_seconds(seg["end"])
+    ov = min(b1, b2) - max(a1, a2)          # שלילי = פער
+    short = max(1, min(b1 - a1, b2 - a2))
+    if ov >= 0.5 * short:
+        return True
+    w1, w2 = last.get("window"), seg.get("window")
+    if w1 and w2 and w1 == w2:
+        return False
+    if ov >= SAME_CONTEXT_OVERLAP:
+        return True
+    if -ov <= gap_tolerance and (last.get("cut_off") or seg.get("cut_off")):
+        return True
+    return False
+
+
 def merge_segments(segments, gap_tolerance: int = 90):
     """
     מאחד כפילויות שנוצרו מהחפיפה בין חלונות.
@@ -809,6 +878,9 @@ def merge_segments(segments, gap_tolerance: int = 90):
     חותך לפי parts. התוצאה: ההמשך שחלון אחר ראה נזרק בשקט (אוהד 15.9 #2
     נגמר ב-02:56:38 באמצע השידוך, והסוף עד 02:59:34 היה בחלון הבא).
     עכשיו parts מתאחדים, ו-start/end נגזרים מהם.
+
+    תוקן 29.9 (67/9): עד אז כל שני קטעים עם פער עד 90 שנ' אוחדו, גם כשהמודל
+    פיצל אותם בכוונה כי הנושא התחלף. עכשיו רק same_context.
     """
     if not segments:
         return []
@@ -816,8 +888,8 @@ def merge_segments(segments, gap_tolerance: int = 90):
     merged = [segments[0]]
     for seg in segments[1:]:
         last = merged[-1]
-        if to_seconds(seg["start"]) <= to_seconds(last["end"]) + gap_tolerance:
-            # חופפים - שומרים את זה עם הציון הגבוה, ומרחיבים את הגבולות
+        if same_context(last, seg, gap_tolerance):
+            # אותו הקשר - שומרים את זה עם הציון הגבוה, ומרחיבים את הגבולות
             keep_new = seg.get("score", 0) > last.get("score", 0)
             keeper = dict(seg if keep_new else last)
             other = last if keep_new else seg
@@ -1294,17 +1366,37 @@ def main() -> None:
         )
 
     def stage_b(body: str, i: int):
-        """שלב ב' על טקסט אחד, בזמן אמת. מחזיר רשימת קטעים, או None בשגיאה."""
-        try:
-            resp = create_message(client, **build_params(body))
-        except Exception as exc:
-            stop_why = fatal_api_error(str(exc))
-            if stop_why:
-                print(f"\n\n{stop_why}")
-                sys.exit(1)
-            print(f"שגיאה: {exc}")
-            return None
-        return handle_b(resp, i)
+        """
+        שלב ב' על טקסט אחד, בזמן אמת. מחזיר רשימת קטעים, או None אם נכשל
+        גם אחרי כל הניסיונות.
+
+        67/3 (29.9): עד היום שגיאה אחת (עומס 529, רשת, תשובה קטועה) = החלון
+        נזרק בשקט, 45 דקות של לייב בלי הודעה. עכשיו: עוד ניסיונות עם המתנה
+        (מעבר ל-2 של ה-SDK), ומה שנכשל נרשם ב-failed_windows ומדווח.
+        """
+        import time
+        last_err = ""
+        for attempt, wait in enumerate(STAGE_B_RETRY_WAITS, 1):
+            if wait:
+                print(f"\n   ניסיון {attempt}/{len(STAGE_B_RETRY_WAITS)} לחלון {i} "
+                      f"בעוד {wait} שנ' ({last_err[:60]}) ...", end=" ", flush=True)
+                time.sleep(wait)
+            try:
+                resp = create_message(client, **build_params(body))
+            except Exception as exc:
+                stop_why = fatal_api_error(str(exc))
+                if stop_why:
+                    print(f"\n\n{stop_why}")
+                    sys.exit(1)
+                last_err = f"שגיאת API: {exc}"
+                print(f"שגיאה: {exc}", flush=True)
+                continue
+            found = handle_b(resp, i)
+            if found is not None:
+                return found
+            last_err = "תשובה ריקה/קטועה, בלי JSON תקין"
+        failed_windows[i] = last_err
+        return None
 
     def handle_b(resp, i: int, batch: bool = False):
         """תשובה של שלב ב' (מזמן אמת או מ-batch) -> רשימת קטעים."""
@@ -1330,12 +1422,18 @@ def main() -> None:
         elif stop == "max_tokens":
             print(f"אזהרה: התשובה נקטעה (max_tokens).", flush=True)
 
-        data = extract_json(text)
-        found = data.get("segments", [])
+        data, ok = extract_json_ok(text)
+        if not ok:
+            # 67/3: לא "אין קטעים" אלא "לא התקבלה תשובה". הקורא ינסה שוב.
+            print(f"אין JSON תקין בתשובה (stop_reason={stop}).", flush=True)
+            return None
+        found = valid_segments(data.get("segments", []), window=i)
         print(f"{len(found)} קטעים  ({tok_in:,} טוקנים)")
         return found
 
     all_segments = []
+    failed_windows = {}      # i -> סיבה. 67/3: חלון שלא נותח לא נעלם בשקט
+    spans = {}               # i -> "hh:mm:ss-hh:mm:ss", לדיווח
     total_in = total_out = 0
     cache_write = cache_read = 0
     triage_in = triage_out = 0
@@ -1344,6 +1442,7 @@ def main() -> None:
 
     for i, block in enumerate(chunks, 1):
         span = f"{hms(block[0]['start'])}-{hms(block[-1]['end'])}"
+        spans[i] = span
         print(f"[{i}/{len(chunks)}] {span} ...", end=" ", flush=True)
 
         # ---------------------------------------------------- שלב א'
@@ -1412,6 +1511,10 @@ def main() -> None:
             else:
                 print(f"[{i}/{len(chunks)}] (batch) ", end="", flush=True)
                 found = handle_b(resp, i, batch=True)
+                if found is None:
+                    # תשובה קטועה מה-batch - שולחים את החלון שוב בזמן אמת
+                    print(f"   [{i}] שולח שוב בזמן אמת ...", end=" ", flush=True)
+                    found = stage_b(dict(batch_jobs)[i], i)
             if found:
                 all_segments.extend(found)
 
@@ -1471,6 +1574,19 @@ def main() -> None:
             lines.append("   שים לב: הקטע עלול להיחתך בקצה")
         lines.append("")
     Path(f"{stem}_segments.txt").write_text("\n".join(lines), encoding="utf-8")
+
+    # 67/3: חלונות שלא נותחו גם אחרי כל הניסיונות. run10 קורא את הקובץ ומדווח
+    # בטלגרם. הקטעים משאר החלונות נשמרו - לא זורקים עבודה ששולם עליה.
+    gaps_path = Path("analysis_gaps.json")
+    if failed_windows:
+        gaps = [{"window": i, "of": len(chunks), "span": spans.get(i, ""), "why": why}
+                for i, why in sorted(failed_windows.items())]
+        gaps_path.write_text(json.dumps(gaps, ensure_ascii=False, indent=1), encoding="utf-8")
+        print(f"\n⚠ {len(gaps)} מתוך {len(chunks)} חלונות לא נותחו:")
+        for g in gaps:
+            print(f"   חלון {g['window']} ({g['span']}): {g['why'][:100]}")
+    elif gaps_path.exists():
+        gaps_path.unlink()
     if BATCH_STATE.exists():
         try:
             BATCH_STATE.replace("batch_state.done.json")
@@ -1549,6 +1665,10 @@ def main() -> None:
     print(f"נשמר: {stem}_segments.txt / .json")
     if args.url:
         print(f"נשמר: {stem}_cut.txt")
+    if failed_windows and len(failed_windows) == len(chunks):
+        # אף חלון לא נותח - זה כישלון של הניתוח, לא "לייב בלי קטעים"
+        print("\nאף חלון לא נותח. יוצא עם שגיאה.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

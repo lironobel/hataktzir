@@ -206,6 +206,8 @@ def pending() -> list:
                 continue
             if backing_off(seg.get("youtube") or {}):
                 continue
+            if yt.is_uploading(seg.get("youtube") or {}):
+                continue                     # 67/5: באמצע העלאה ממסלול אחר
             out.append({
                 "job": job.name,
                 "idx": i,
@@ -368,6 +370,12 @@ def tick(force: bool = False, notify=None) -> dict:
     מחזירה dict עם `did` - האם באמת הועלה משהו.
     """
     global _auth_broken_mtime
+    try:
+        from tg import paused
+        if paused():
+            return {"did": False, "reason": "paused"}     # /pause - גם force לא עוקף
+    except ImportError:
+        pass
     items = pending()
     if not items:
         # מעקב "האם התקציב עוצר את הערוץ" (57): שעה שבה התור ריק ויש מכסה.
@@ -390,6 +398,9 @@ def tick(force: bool = False, notify=None) -> dict:
     res = yt.upload_clip(job, item["idx"])
     res.update({"did": True, "job": item["job"], "idx": item["idx"],
                 "title": item["title"], "left": len(items) - 1})
+    if res.get("busy"):
+        # 67/5: מסלול אחר מעלה אותו עכשיו. לא כישלון, לא נספר, לא מודיעים.
+        return {"did": False, "reason": "busy", "queued": len(items)}
     if res.get("auth"):
         # הודעה אחת, לא כל 10 דקות: הסבב הבא יחזיר reason=auth בשקט
         _auth_broken_mtime = token_mtime()

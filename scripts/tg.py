@@ -65,10 +65,50 @@ def call(method: str, **params):
         return None
 
 
-def notify(text: str, silent: bool = False, buttons: list = None) -> bool:
+IMPORTANT_MARK = "🔴 "
+
+# ---------------------------------------------------- עצירת חירום (29.9)
+# /pause בטלגרם יוצר את הקובץ, /resume מוחק. כל רכיב בודק אותו:
+#   monitor10  - לא בודק לייבים, לא מפעיל, לא מנסה שוב (אבל כן כותב
+#                monitor_state.json, כדי שה-watchdog לא יצעק "המנטר קפא")
+#   run10      - לא מתחיל עבודה (גם /retry ידני)
+#   uploadq / tgbot2 - לא מעלים ליוטיוב
+# קובץ ולא משתנה בזיכרון: שורד הפעלה מחדש של המחשב, ורואים אותו מכל תהליך.
+PAUSE_PATH = ROOT / "PAUSED.json"
+
+
+def paused() -> dict:
+    """{} אם הכל רץ. אחרת {"since": ..., "why": ...}."""
+    if not PAUSE_PATH.exists():
+        return {}
+    try:
+        data = json.loads(PAUSE_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) and data else {"since": "?"}
+    except Exception:
+        return {"since": "?"}          # קובץ פגום עדיין אומר "עצור"
+
+
+def set_paused(on: bool, why: str = "") -> None:
+    if on:
+        from datetime import datetime
+        PAUSE_PATH.write_text(json.dumps(
+            {"since": datetime.now().strftime("%d/%m %H:%M"), "why": why},
+            ensure_ascii=False), encoding="utf-8")
+    else:
+        PAUSE_PATH.unlink(missing_ok=True)
+
+
+def notify(text: str, silent: bool = None, buttons: list = None,
+           important: bool = False) -> bool:
     """
     שולח הודעה. buttons היא רשימה של רשימות:
         [[{"text": "אשר", "callback_data": "ok:1"}], [{"text": "דחה", "callback_data": "no:1"}]]
+
+    צליל ורטט (29.9, בקשת לירון): **ברירת המחדל שקטה.** הודעה מגיעה לצ'אט
+    בלי צליל ובלי רטט - עלה לשדר, סיים, התקדמות, העלאה שהצליחה.
+    important=True = משהו שמחכה לך או נכשל ודורש תגובה: עם צליל ורטט,
+    ו-🔴 בתחילת ההודעה כדי שיהיה קל לזהות אותה ברשימה.
+    silent=False מפורש (קוד ישן) נחשב כ-important בלי הסימון.
     """
     cfg = load_config()
     if not cfg.get("enabled", True):
@@ -78,11 +118,14 @@ def notify(text: str, silent: bool = False, buttons: list = None) -> bool:
         print("אין chat_id. הרץ:  python scripts\\tg.py setup", file=sys.stderr)
         return False
 
+    loud = important or silent is False
+    if important and not text.startswith(IMPORTANT_MARK):
+        text = IMPORTANT_MARK + text
     params = {
         "chat_id": chat_id,
         "text": text,
         "parse_mode": "HTML",
-        "disable_notification": silent,
+        "disable_notification": not loud,
     }
     if buttons:
         params["reply_markup"] = json.dumps({"inline_keyboard": buttons})
@@ -91,7 +134,7 @@ def notify(text: str, silent: bool = False, buttons: list = None) -> bool:
     return bool(res and res.get("ok"))
 
 
-def send_photo(path, caption: str = "", buttons: list = None, silent: bool = False) -> bool:
+def send_photo(path, caption: str = "", buttons: list = None, silent: bool = True) -> bool:
     """שולח תמונה - בשביל התמנייל, כדי לראות אותו לפני שהוא ביוטיוב."""
     cfg = load_config()
     chat_id, token = cfg.get("chat_id", ""), cfg.get("token", "")
@@ -116,7 +159,7 @@ def send_photo(path, caption: str = "", buttons: list = None, silent: bool = Fal
 
 
 def send_video(path, caption: str = "", buttons: list = None,
-               silent: bool = False, reply_to: int = 0) -> bool:
+               silent: bool = True, reply_to: int = 0) -> bool:
     """
     שולח וידאו עם כפתורים אופציונליים מתחתיו.
     טלגרם מגבילה בוט ל-50MB, ולכן קליפ שלם כמעט אף פעם לא נכנס -

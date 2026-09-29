@@ -311,7 +311,9 @@ def pick_cold_open(job: Path, idx: int, seg: dict, rows: list, ranges: list,
     client = an.anthropic.Anthropic()
     model = an.pick_model(client, model)
     try:
-        resp = an.create_message(client, model=model, max_tokens=1500,
+        # 29.9: היה 1500 - 11 קריאות נקטעו בדיוק שם (חשיבה של סונט 5 נספרת בפנים),
+        # ו"אין רגע מתאים" היה בחלק מהמקרים תשובה קטועה, לא החלטה.
+        resp = an.create_message(client, model=model, max_tokens=8000,
                                  messages=[{"role": "user", "content": prompt}])
     except Exception as exc:
         stop = an.fatal_api_error(str(exc))

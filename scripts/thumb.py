@@ -137,7 +137,7 @@ WINDOW_SEC = 15          # ±15 שניות סביב הציטוט
 N_FRAMES = 20
 N_FINALISTS = 5
 N_SPREAD = 10            # 27.9: עוד פריימים לאורך כל הקטע - צחוק אמיתי לא תמיד ליד הציטוט
-N_SPREAD_KEEP = 3
+N_SPREAD_KEEP = 4           # 29.9: היה 3. קודם אנשים שלא נראו עדיין, ראה new_people_first
 
 # חתימת הסדרה: הקו האלכסוני של ה-Z בלוגו. אותה זווית, אותו מקום.
 SLASH_TOP = (668, 64)
@@ -458,7 +458,7 @@ def score_frames(frames: list, n: int = N_FINALISTS) -> list:
             sharp = sharpness(img)
             score = min(sharp, 800) / 80
         scored.append({"path": path, "t": t, "face": face, "faces": faces,
-                       "score": score})
+                       "score": score, "size": (img.width, img.height)})
     scored.sort(key=lambda s: -s["score"])
 
     # לא חמישה פריימים צמודים מאותה שנייה
@@ -469,6 +469,31 @@ def score_frames(frames: list, n: int = N_FINALISTS) -> list:
         if len(picked) >= n:
             break
     return picked
+
+
+def face_centers(fr: dict) -> list:
+    """מרכזי הפנים בפריים, יחסית לגודל התמונה (0-1)."""
+    iw, ih = fr.get("size") or (1920, 1080)
+    return [((x + w / 2) / iw, (y + h / 2) / ih) for x, y, w, h in (fr.get("faces") or [])]
+
+
+def new_people_first(extra: list, finalists: list, min_dist: float = 0.15) -> list:
+    """
+    29.9 (ניק 15.9 #1): הניצולים הראשונים כולם עם הפנים הגדולות - מיכאל,
+    שהשידור שלו היה על המסך. המצלמה הקטנה של ניק הופיעה רק בחלק מהקטע,
+    ולא הגיעה למודל בכלל, אז הוא "בחר" את מיכאל כסטרימר. כאן: מהפריימים
+    המפוזרים, קודם אלה שיש בהם פנים במקום שעוד לא נראו פנים - כלומר כנראה
+    אדם אחר - ורק אחר כך השאר.
+    """
+    seen = [c for f in finalists for c in face_centers(f)]
+    fresh, rest = [], []
+    for f in extra:
+        new = any(all(((cx - sx) ** 2 + (cy - sy) ** 2) ** 0.5 >= min_dist for sx, sy in seen)
+                  for cx, cy in face_centers(f))
+        (fresh if new else rest).append(f)
+        if new:
+            seen += face_centers(f)
+    return fresh + rest
 
 
 def mood(seg: dict) -> str:
@@ -529,7 +554,8 @@ def cam_bounds(img: Image.Image, face):
     return (max(0, left), max(0, top), right, bottom)
 
 
-def face_crop(img: Image.Image, face, out_w: int, out_h: int) -> Image.Image:
+def face_crop(img: Image.Image, face, out_w: int, out_h: int,
+              zoom: float = 3.3) -> Image.Image:
     """
     חותך סביב הפנים כך שהראש ייכנס עם כתפיים ויצא מהקצה התחתון.
     בלי פנים - חיתוך מרכזי, שיהיה לפחות משהו.
@@ -539,7 +565,9 @@ def face_crop(img: Image.Image, face, out_w: int, out_h: int) -> Image.Image:
         x, y, w, h = face
         bl, bt, br, bb = cam_bounds(img, face)
         bw, bh = br - bl, bb - bt
-        ch = min(bh, h * 3.3)
+        # zoom = גובה החיתוך ביחס לגובה הפנים. בשני פרצופים כל צד צר, ולכן
+        # 29.9: 2.4 - אחרת הפנים יצאו קטנות בפינה (מיכאל בניק 15.9 #1).
+        ch = min(bh, h * zoom)
         cw = ch * ratio
         if cw > bw:                               # צר מדי - מקטינים את שניהם
             cw = bw
@@ -605,6 +633,7 @@ def region_crop(img: Image.Image, box, out_w: int, out_h: int) -> Image.Image:
 SLOPE = (SLASH_TOP[0] - SLASH_BOTTOM[0]) / (SLASH_BOTTOM[1] - SLASH_TOP[1])
 DIV_TOP = 420
 DIV_BOTTOM = int(DIV_TOP - SLOPE * H)
+DUO_ZOOM = 2.4               # 29.9: שני פרצופים - חיתוך צמוד יותר, שכל אחד ימלא את החצי שלו
 DUO_FADE_FROM = 600          # בשתי תמונות הנמוג מתחיל מאוחר, שהסטרימר לא ייבלע
 
 
@@ -651,12 +680,12 @@ def compose(frame: Image.Image, face, text: str, emphasis: str,
         right_w = PHOTO_W - right_x0
         if other:
             # 27.9: מי שמולו יכול לבוא מפריים אחר - כל צד ברגע הכי טוב שלו
-            left = face_crop(other_frame or frame, other, left_w, H)
+            left = face_crop(other_frame or frame, other, left_w, H, zoom=DUO_ZOOM)
         else:
             left = region_crop(frame, content_box, left_w, H)
             left = left.filter(ImageFilter.UnsharpMask(radius=2, percent=60, threshold=3))
         canvas.paste(left, (0, 0))
-        right = face_crop(frame, face, right_w, H)
+        right = face_crop(frame, face, right_w, H, zoom=DUO_ZOOM if other else 3.3)
         edge = lambda y: DIV_TOP - SLOPE * y
         paste_photo(canvas, right, right_x0, DUO_FADE_FROM, edge)
         d0 = ImageDraw.Draw(canvas)
@@ -781,6 +810,42 @@ def draw_word_line(d, x_right, y, words, f, color_of, space, stroke: int = 0) ->
 
 LETTERS = "ABCDEFGH"
 CAM_FILE = ROOT / "cam_positions.json"
+# 29.9: תמונת ייחוס לכל סטרימר - איך הוא נראה. בלי זה המודל לא יודע מי
+# ניק ומי מיכאל, ובניק 15.9 #1 הוא בחר את מיכאל (על המסך, עם אוזניות) כ"סטרימר".
+# brand\faces\<slug>.jpg. נוצרת לבד כשהמודל והזיכרון של המצלמה מסכימים,
+# ואפשר להחליף ידנית בכל תמונה ברורה של הפנים.
+REF_DIR = ROOT / "brand" / "faces"
+
+
+def ref_image(slug: str):
+    p = REF_DIR / f"{(slug or '').lstrip('@').lower()}.jpg"
+    return p if slug and p.exists() else None
+
+
+def slug_of_name(name: str) -> str:
+    """שם בעברית (כמו ב-participants) -> slug מ-watchlist.json, או ""."""
+    for s in load_json(ROOT / "watchlist.json", {}).get("streamers", []):
+        if name and name.strip() == str(s.get("name", "")).strip() and s.get("slug"):
+            return str(s["slug"])
+    return ""
+
+
+def save_ref(slug: str, img: Image.Image, face) -> None:
+    if not slug or not face or ref_image(slug):
+        return
+    try:
+        REF_DIR.mkdir(parents=True, exist_ok=True)
+        face_crop(img, face, 360, 360).save(REF_DIR / f"{slug.lstrip('@').lower()}.jpg",
+                                             quality=90)
+        print(f"  נשמרה תמונת ייחוס: brand\\faces\\{slug.lstrip('@').lower()}.jpg")
+    except Exception as exc:
+        print(f"  תמונת ייחוס לא נשמרה: {exc}")
+
+
+def b64_jpeg(img: Image.Image, quality: int = 80) -> str:
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="JPEG", quality=quality)
+    return base64.standard_b64encode(buf.getvalue()).decode()
 
 
 def face_sheet(finalists: list):
@@ -810,14 +875,48 @@ def face_sheet(finalists: list):
     return sheet
 
 
+def face_grid(finalists: list, cell: int = 200, cols: int = 6):
+    """
+    29.9: כל הפנים שזוהו, מוגדלות, עם תווית פריים+אות ("3A"). בגיליון הפריימים
+    מצלמה קטנה בפינה היא 20-30 פיקסלים - אי אפשר להשוות אותה לתמונת ייחוס.
+    בניק 15.9 #1 המודל קיבל את תמונת הייחוס של ניק ועדיין בחר את מיכאל.
+    """
+    items = []
+    for i, fr in enumerate(finalists):
+        faces = fr.get("faces") or []
+        if not faces:
+            continue
+        img = Image.open(fr["path"]).convert("RGB")
+        for j, (x, y, w, h) in enumerate(faces[:len(LETTERS)]):
+            pad = int(max(w, h) * 0.35)
+            box = (max(0, x - pad), max(0, y - pad),
+                   min(img.width, x + w + pad), min(img.height, y + h + pad))
+            items.append((f"{i + 1}{LETTERS[j]}", img.crop(box).resize((cell, cell))))
+    if not items:
+        return None
+    rows = (len(items) + cols - 1) // cols
+    grid = Image.new("RGB", (cell * cols, cell * rows), (0, 0, 0))
+    d = ImageDraw.Draw(grid)
+    lf = font(34, "Bold")
+    for k, (label, im) in enumerate(items):
+        ox, oy = (k % cols) * cell, (k // cols) * cell
+        grid.paste(im, (ox, oy))
+        d.rectangle([ox, oy, ox + 70, oy + 42], fill=(0, 0, 0))
+        d.text((ox + 6, oy + 2), label, font=lf, fill=(0, 255, 255))
+    return grid
+
+
 def ask_vision(finalists: list, text: str, title: str, streamer: str = "",
-               quote: str = "", feel: str = ""):
+               quote: str = "", feel: str = "", cam_hint: dict = None,
+               participants: list = None, slug: str = ""):
     """
     קריאת ראייה אחת שמחליטה הכל. מחזיר dict:
         frame     אינדקס הפריים (0-based)
         streamer  אינדקס הפנים של הסטרימר בפריים הזה, או None
         other     אינדקס הפנים של מי שמולו / עליו מדברים, או None
         quote     ציטוט קצר (עד 5 מילים) מתוך quote, או ""
+        screen    האם המסך שמחוץ למצלמה מראה את מה שמדברים עליו (סרטון,
+                  תמונה, רגע במשחק) - רק אז הוא נכנס לתמנייל (29.9)
     או None אם אין מודל / התשובה לא שמישה.
     """
     if not os.environ.get("ANTHROPIC_API_KEY") or not finalists:
@@ -835,16 +934,64 @@ def ask_vision(finalists: list, text: str, title: str, streamer: str = "",
 
     who = streamer or "הסטרימר"
     feel = feel or "הבעה חזקה: הלם, צחוק, פליאה"
+    hint = ""
+    if cam_hint:
+        hint = (f"רמז: בלייבים קודמים המצלמה של {who} ישבה בערך {cam_hint['cx'] * 100:.0f}% "
+                f"מהשמאל ו-{cam_hint['cy'] * 100:.0f}% מלמעלה, ברוחב {cam_hint['w'] * 100:.0f}% "
+                "מהמסך. זה רמז בלבד - לפעמים המיקום משתנה.\n")
+    guests = ", ".join(p for p in (participants or []) if p and p != streamer)
+
+    # תמונות ייחוס: הסטרימר, ועד שניים מהמשתתפים שיש להם
+    refs = []
+    if ref_image(slug):
+        refs.append((who, ref_image(slug)))
+    for name in participants or []:
+        if len(refs) >= 3 or not name or name == streamer:
+            continue
+        r = ref_image(slug_of_name(name))
+        if r:
+            refs.append((name, r))
+    ref_blocks, ref_text = [], ""
+    for i, (name, path) in enumerate(refs, 1):
+        try:
+            ref_blocks.append({"type": "image", "source": {
+                "type": "base64", "media_type": "image/jpeg",
+                "data": b64_jpeg(Image.open(path))}})
+        except Exception:
+            continue
+        ref_text += f"תמונת ייחוס {i} (לפני הפריימים): {name}.\n"
+    grid = face_grid(finalists)
+    grid_block = ([{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                                "data": b64_jpeg(grid)}}] if grid else [])
+    if ref_text:
+        ref_text = ("כדי לזהות מי זה מי - " + ref_text
+                    + "זהה לפי הפנים, לא לפי המיקום או הגודל על המסך.\n")
+    if grid:
+        ref_text += ("התמונה האחרונה: כל פנים שזוהו, מוגדלות, עם תווית פריים+אות (למשל 3A = פריים 3, "
+                     "פנים A). **השווה כל אחת מהן לתמונות הייחוס** - לפי משקפיים, זקן, שיער, כובע - "
+                     f"לפני שאתה קובע מי {who}. אם אף אחת לא דומה ל-{who} בתמונת הייחוס: "
+                     "streamer: null.\n")
     prompt = (
         f"אלה {len(finalists)} פריימים ממוספרים מקטע בלייב של {who}. "
+        + ("(התמונות לפני הפריימים הן תמונות ייחוס.) " if ref_blocks else "") +
         "על כל פנים שזוהו יש מסגרת עם אות (A, B...). האותיות נפרדות בכל פריים.\n"
         f"כותרת הסרטון: \"{title}\"\n"
         f"טקסט התמנייל: \"{text}\"\n"
         + (f"הציטוט מהרגע הזה: \"{quote}\"\n" if quote else "")
         + f"אופי הקטע: {feel}\n"
+        + (f"משתתפים נוספים בקטע: {guests}\n" if guests else "")
+        + ref_text
+        + hint
         + "\nהתמנייל מורכב משתי תמונות נפרדות: " + who + " בצד אחד, ומי שהוא מדבר "
         "איתו או עליו בצד השני. **כל צד יכול לבוא מפריים אחר** - בחר לכל אחד את "
         "הרגע הכי טוב שלו.\n"
+        "⚠ זהירות: לפעמים על המסך מוצג **שידור של סטרימר אחר** (שיתוף מסך, צפייה "
+        "בלייב שלו), ושם יש פנים גדולות עם אוזניות. זה לא " + who + " - זה other. "
+        f"{who} הוא מי שהמצלמה שלו שייכת לשידור הזה, ולרוב היא חלון קטן ועקבי יותר. "
+        "אם הפנים של " + who + " לא מסומנות באות באף פריים - streamer: null, "
+        "ואל תבחר מישהו אחר במקומו.\n"
+        + "other חייב להיות **אדם אחר** מ-" + who + " - לא אותו אדם מפריים אחר. "
+        "אם אין אדם אחר - other: null.\n"
         f"1. streamer_frame + streamer - הפריים והאות של {who} עצמו (מי שמשדר: בדרך "
         "כלל עם אוזניות או מיקרופון, מול המצלמה שלו, באותו מקום בכל הפריימים). "
         f"{who} חייב להיראות טוב: עיניים פקוחות, לא באמצע מילה עם פה עקום, לא עיניים "
@@ -853,20 +1000,27 @@ def ask_vision(finalists: list, text: str, title: str, streamer: str = "",
         "2. other_frame + other - הפריים והאות של מי שהוא מדבר איתו או עליו (שיחת "
         "וידאו, אורח, מי שמופיע בסרטון שהוא מגיב אליו), ברגע הכי חזק שלו. null לשניהם "
         "אם אין כזה באף פריים, או שזה סתם מישהו ברקע, ציור או לוגו.\n"
-        + ("3. short_quote - עד 5 מילים מתוך הציטוט, מילה במילה, החלק הכי חזק "
+        + "3. screen_is_topic - true רק אם החלק של המסך שמחוץ למצלמה מראה את מה "
+        f"ש{who} מגיב אליו (סרטון, תמונה, ציוץ, רגע במשחק) ויעבוד כחצי תמנייל. "
+        "false אם זה צ'אט, תפריטים, דף אינטרנט עם טקסט, או סתם רקע. כשיש other - "
+        "לא משנה.\n"
+        + ("4. short_quote - עד 5 מילים מתוך הציטוט, מילה במילה, החלק הכי חזק "
            "ומסקרן. \"\" אם אין בו משהו שעובד לבד.\n" if quote else "")
-        + 'החזר JSON בלבד: {"streamer_frame": <מספר>, "streamer": "A", '
+        + 'החזר JSON בלבד: {"streamer_frame": <מספר> או null, "streamer": "A" או null, '
         '"other_frame": <מספר> או null, "other": "B" או null, '
-        '"short_quote": "...", "why": "<קצר>"}'
+        '"screen_is_topic": false, "short_quote": "...", "why": "<קצר>"}'
     )
     client = anthropic.Anthropic()
     model = az.pick_model(client, "claude-sonnet-5")
     try:
         resp = az.create_message(
-            client, model=model, max_tokens=3000,
-            messages=[{"role": "user", "content": [
+            # 29.9: היה 3000. סונט 5 חושב לפני התשובה, והחשיבה נספרת בתוך max_tokens -
+            # 3 מתוך 7 קריאות נקטעו ב-3000 בדיוק, בלי JSON, והתמנייל נבנה בלי מודל בשקט.
+            client, model=model, max_tokens=12000,
+            messages=[{"role": "user", "content": ref_blocks + [
                 {"type": "image", "source": {"type": "base64",
                                              "media_type": "image/jpeg", "data": b64}},
+            ] + grid_block + [
                 {"type": "text", "text": prompt},
             ]}])
     except Exception as exc:
@@ -877,7 +1031,12 @@ def ask_vision(finalists: list, text: str, title: str, streamer: str = "",
         az.log_usage(ROOT, model, t_in, t_out, "thumb", cw, cr)
     except Exception:
         pass
-    return parse_vision(az.extract_json(az.response_text(resp)), finalists, quote)
+    if getattr(resp, "stop_reason", "") == "max_tokens":
+        print("  ⚠ תשובת המודל נקטעה (max_tokens) - בונה בלי החלטת מודל")
+    picked = parse_vision(az.extract_json(az.response_text(resp)), finalists, quote)
+    if picked is None:
+        print("  ⚠ המודל לא החזיר החלטה שמישה - בונה לפי זיכרון המצלמה")
+    return picked
 
 
 def parse_vision(data, finalists: list, quote: str = ""):
@@ -906,22 +1065,31 @@ def parse_vision(data, finalists: list, quote: str = ""):
         return i if 0 <= i < len(faces) else None
 
     sf = frame_of("streamer_frame", data.get("frame", data.get("pick")))
-    if sf is None:
-        return None
     of = frame_of("other_frame", data.get("frame")) if data.get("other") else None
-    s, o = letter("streamer", sf), letter("other", of)
+    s = letter("streamer", sf) if data.get("streamer") else None
+    o = letter("other", of)
     if o is not None and of == sf and o == s:
         o = None
     if o is None:
         of = None
+    if s is None:
+        # 29.9: הסטרימר לא נראה (או לא זוהה). לא ממציאים אותו - אם יש מישהו
+        # אחר, הוא התמונה היחידה; אחרת אין החלטה.
+        if of is None:
+            return None if sf is None else {"frame": sf, "streamer": None, "other_frame": None,
+                                            "other": None, "quote": "", "screen": False}
+        sf = of
     sq = str(data.get("short_quote") or "").strip().strip('"״“”')
     # רק מילים שבאמת נאמרו - המודל לא ממציא ציטוט
     if sq and (len(sq.split()) > 6 or not all(w in (quote or "") for w in sq.split())):
         sq = ""
+    screen = data.get("screen_is_topic") is True
     print(f"  המודל: סטרימר={data.get('streamer')} בפריים {sf + 1}"
           + (f", מולו={data.get('other')} בפריים {of + 1}" if of is not None else ", אין מולו")
+          + (", המסך הוא הנושא" if screen else "")
           + f" · {str(data.get('why', ''))[:60]}")
-    return {"frame": sf, "streamer": s, "other_frame": of, "other": o, "quote": sq}
+    return {"frame": sf, "streamer": s, "other_frame": of, "other": o, "quote": sq,
+            "screen": screen}
 
 
 # -------------------------------------------------- זיכרון מצלמה לסטרימר
@@ -1018,24 +1186,37 @@ def make_thumbnail(job, idx: int, use_llm: bool = True, at: str = "",
     if use_llm:
         extra = [f for f in score_frames(grab_spread(clip, work, length), N_SPREAD)
                  if f["face"] and all(abs(f["t"] - x["t"]) >= 2.0 for x in finalists)]
-        finalists += extra[:N_SPREAD_KEEP]
+        finalists += new_people_first(extra, finalists)[:N_SPREAD_KEEP]
     faces = sum(1 for f in finalists if f["face"])
     print(f"  {len(frames)} פריימים, {len(finalists)} ניצולים, {faces} עם פנים"
           + ("" if cv2 is not None else "  (אין OpenCV - בלי זיהוי פנים)"))
 
     slug = meta.get("streamer") or ""
     full_quote = (seg.get("quote") or "").strip()
+    cam_hint = load_json(CAM_FILE, {}).get(slug or "")
     pick = (ask_vision(finalists, text, seg.get("title", ""), streamer, full_quote,
-                       mood(seg)) if use_llm else None)
+                       mood(seg), cam_hint=cam_hint,
+                       participants=seg.get("participants"), slug=slug) if use_llm else None)
     best = finalists[pick["frame"] if pick else 0]
     frame = Image.open(best["path"]).convert("RGB")
     faces = best.get("faces") or ([best["face"]] if best["face"] else [])
 
     # מי הסטרימר ומי מולו. 1) המודל  2) זיכרון המצלמה  3) כמו פעם
+    #
+    # הפריסה (29.9, בקשת לירון):
+    #   סטרימר + מישהו מולו          -> שני פרצופים
+    #   סטרימר לבד, המסך הוא הנושא   -> סטרימר + חצי מהמסך (תגובה לסרטון)
+    #   סטרימר לבד                    -> רק הפנים שלו, גדול
+    #   הסטרימר לא נראה               -> הפנים הכי טובות, תמונה אחת
+    # עד 29.9 כל "סטרימר לבד" קיבל חצי מסך - גם כשזה היה צ'אט ותפריטים.
     s_i = pick["streamer"] if pick else None
     o_i = pick["other"] if pick else None
     how = "מודל"
-    if s_i is None:
+    if pick and s_i is None and o_i is not None:
+        # המודל: הסטרימר לא נראה, אבל יש את מי שמדברים עליו - הוא התמונה
+        s_i, o_i, how = o_i, None, "מודל (הסטרימר לא נראה)"
+        pick = dict(pick, other_frame=None)
+    elif s_i is None:
         s_i = match_cam(slug, faces, frame.width, frame.height)
         how = "זיכרון מצלמה" if s_i is not None else ""
         if s_i is not None and o_i is None:
@@ -1043,7 +1224,15 @@ def make_thumbnail(job, idx: int, use_llm: bool = True, at: str = "",
                       and faces[k][2] * faces[k][3] >= 0.015 * frame.width * frame.height]
             o_i = others[0] if others else None
     elif slug:
-        remember_cam(slug, faces[s_i], frame.width, frame.height)
+        # תמונת ייחוס נשמרת רק כששני סימנים בלתי תלויים מסכימים: המודל בחר,
+        # והפנים במקום של המצלמה מהזיכרון (או שאין זיכרון בכלל - סטרימר חדש).
+        # אחרת טעות אחת (מיכאל כ"ניק") הייתה נצרבת לכל הלייבים הבאים.
+        agree = (cam_hint is None
+                 or match_cam(slug, [faces[s_i]], frame.width, frame.height) == 0)
+        if agree:
+            save_ref(slug, frame, faces[s_i])
+        if agree or ref_image(slug):
+            remember_cam(slug, faces[s_i], frame.width, frame.height)
 
     if s_i is not None:
         face = faces[s_i]
@@ -1057,7 +1246,9 @@ def make_thumbnail(job, idx: int, use_llm: bool = True, at: str = "",
                 other = ofr["faces"][o_i]
             else:
                 other = faces[o_i]
-        content = None if other else content_region(frame, face)
+        # חצי מסך רק כשהמודל אמר שהמסך הוא הנושא. בלי מודל - אף פעם.
+        content = (content_region(frame, face)
+                   if not other and pick and pick.get("screen") else None)
     else:                                    # לא יודעים מי הסטרימר - תמונה אחת
         face, other, content, other_img = best["face"], None, None, None
 

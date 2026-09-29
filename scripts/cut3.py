@@ -48,6 +48,7 @@ except Exception as _exc:          # hook.py חסר - חותכים כרגיל, �
     HOOK_IMPORT_ERROR = str(_exc)
     HOOK_FADE = 0.25
 
+JUMP_FADE_GAP = 3.0   # פער בשידור בין parts (שנ') שממנו יש מעבר לשחור (67/9)
 
 # ---------------------------------------------------------------- עזרי זמן
 
@@ -388,7 +389,8 @@ def download_part(url: str, start: float, end: float, target: Path,
     return subprocess.run(cmd).returncode == 0
 
 
-def concat(parts: list, target: Path, fade_first: bool = False) -> bool:
+def concat(parts: list, target: Path, fade_first: bool = False,
+           fade_after: set = None) -> bool:
     """
     מדביק חלקים לקובץ אחד, בקידוד מחדש כדי שהתפרים יהיו חלקים.
 
@@ -401,6 +403,11 @@ def concat(parts: list, target: Path, fade_first: bool = False) -> bool:
 
     fade_first: החלק הראשון הוא טיזר (cold open). יציאה קצרה לשחור
     בסופו וכניסה בתחילת הבא, כדי שהצופה יבין שהייתה קפיצה בזמן.
+
+    fade_after (67/9, 29.9, החלטת לירון): אינדקסים של חלקים שאחריהם יש קפיצה
+    בזמן בשידור (פער בין parts). אותו מעבר לשחור כמו אחרי הטיזר. עד היום
+    ההדבקה של parts הייתה חיתוך חד, והצופה לא הבין שדילגנו.
+    ה-fade לא משנה אורכים - רק מכהה את הקצוות - כך ש-lead, פרקים ותמנייל לא זזים.
     """
     parts = [Path(p) for p in parts]
     cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y"]
@@ -412,19 +419,29 @@ def concat(parts: list, target: Path, fade_first: bool = False) -> bool:
     first = probe_video(parts[0])
     w, h = first.get("width") or 1280, first.get("height") or 720
     fps = first.get("fps") or 30
-    fade = HOOK_FADE if fade_first and n > 1 else 0.0
-    d0 = probe_duration(parts[0]) if fade else 0.0
-    if fade and d0 <= fade * 3:
-        fade = 0.0
+    bounds = set(fade_after or ())
+    if fade_first and n > 1:
+        bounds.add(0)
+    bounds = {b for b in bounds if 0 <= b < n - 1}
+    durs = {}
+    for b in sorted(bounds):
+        # חלק קצר מדי לא מקבל fade (אותו כלל כמו לטיזר) - המעבר נשאר חד
+        for k in (b, b + 1):
+            if k not in durs:
+                durs[k] = probe_duration(parts[k])
+        if durs[b] <= HOOK_FADE * 3 or durs[b + 1] <= HOOK_FADE * 3:
+            bounds.discard(b)
+    fade = HOOK_FADE
     chains = []
     for i in range(n):
         vfx, afx = "", ""
-        if fade and i == 0:
-            vfx = f",fade=t=out:st={d0 - fade:.3f}:d={fade}"
-            afx = f",afade=t=out:st={d0 - fade:.3f}:d={fade}"
-        elif fade and i == 1:
-            vfx = f",fade=t=in:st=0:d={fade}"
-            afx = f",afade=t=in:st=0:d={fade * 0.6:.3f}"
+        if i - 1 in bounds:             # כניסה מהשחור
+            vfx += f",fade=t=in:st=0:d={fade}"
+            afx += f",afade=t=in:st=0:d={fade * 0.6:.3f}"
+        if i in bounds:                 # יציאה לשחור
+            d = durs[i]
+            vfx += f",fade=t=out:st={d - fade:.3f}:d={fade}"
+            afx += f",afade=t=out:st={d - fade:.3f}:d={fade}"
         chains.append(
             f"[{i}:v:0]scale={w}:{h}:force_original_aspect_ratio=decrease,"
             f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},"
@@ -702,6 +719,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     ok = 0
+    failures = []       # (idx, כותרת, סיבה) - 67/4: לא נעלמים בשקט
     leads = {}          # idx -> אורך הטיזר שבאמת נכנס לקובץ
     existed = set()     # קליפים שלא נחתכו עכשיו - לא נוגעים ברשומה שלהם
     print()
@@ -756,19 +774,26 @@ def main() -> None:
 
         if failed:
             # החלקים שכבר ירדו נשארים: הרצה חוזרת תשתמש בהם ולא תוריד שוב
+            failures.append((idx, seg.get("title", ""), "ההורדה נכשלה"))
             continue
 
         has_hook = bool(made) and made[0].stem.endswith("__p0")
         lead = probe_duration(made[0]) if has_hook else 0.0
+        # 67/9: קפיצה בזמן בין parts (דילוג על זמן מת) = מעבר לשחור קצר
+        shift = 1 if has_hook else 0
+        jumps = {j - 1 + shift for j in range(1, len(ranges))
+                 if ranges[j][0] - ranges[j - 1][1] > JUMP_FADE_GAP}
         if len(made) == 1:
             made[0].rename(final)
         else:
-            print(f"     מדביק {len(made)} חלקים...")
-            if concat(made, final, fade_first=has_hook):
+            print(f"     מדביק {len(made)} חלקים"
+                  + (f" ({len(jumps)} מעברים לשחור בקפיצות זמן)" if jumps else "") + "...")
+            if concat(made, final, fade_first=has_hook, fade_after=jumps):
                 for p in made:
                     p.unlink(missing_ok=True)
             else:
                 print("     ההדבקה נכשלה, משאיר את החלקים בנפרד.")
+                failures.append((idx, seg.get("title", ""), "ההדבקה נכשלה"))
                 continue
 
         leads[idx] = round(lead, 2)
@@ -819,6 +844,18 @@ def main() -> None:
     ranges_path.write_text(
         json.dumps([by_idx[k] for k in sorted(by_idx)], ensure_ascii=False, indent=1),
         encoding="utf-8")
+
+    # 67/4 (29.9): עד היום יציאה עם 0 גם כש-3 מתוך 4 נחתכו, ו-run10 מתריע
+    # רק על קוד שאינו 0. עכשיו: הרשימה בקובץ, וקוד 2 = "חלק נכשלו".
+    fail_path = out_dir / "cut_failures.json"
+    if failures:
+        fail_path.write_text(json.dumps(
+            [{"idx": i, "title": t, "why": w} for i, t, w in failures],
+            ensure_ascii=False, indent=1), encoding="utf-8")
+        print(f"\n⚠ {len(failures)} קטעים לא נחתכו: "
+              + ", ".join(f"[{i}]" for i, _, _ in failures))
+        sys.exit(2)
+    fail_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

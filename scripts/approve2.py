@@ -117,6 +117,15 @@ def segment_text(idx: int, seg: dict, minutes, note: str = "", desc: dict = None
     return "\n".join(lines) + note
 
 
+def has_clip(job_dir: Path, idx: int) -> bool:
+    """
+    יש קובץ וידאו שלם לקטע. לא דרך preview.clip_for - הוא נופל גם ל-__p1
+    שנשאר מהדבקה שנכשלה (סקירה 28.9, #18), וזה בדיוק לא קליפ.
+    """
+    return any("__p" not in p.stem
+               for p in (Path(job_dir) / "clips").glob(f"{idx:02d} - *.mp4"))
+
+
 def send_for_approval(job_dir: Path, min_score: int = 6, with_video: bool = True) -> int:
     """שולח את הקטעים לאישור. מחזיר כמה נשלחו."""
     job_dir = Path(job_dir)
@@ -133,6 +142,11 @@ def send_for_approval(job_dir: Path, min_score: int = 6, with_video: bool = True
             continue
         if seg.get("approved") is not None:      # כבר הוחלט
             continue
+        # 67/7 (29.9): רק קטע שיש לו קובץ וידאו. run10 חותך לסטרימר בינוני/קטן
+        # רק מציון 7, אבל כאן ברירת המחדל 6 - וקטעים בציון 6 הגיעו לאישור בלי
+        # סרטון. ✓ עליהם = 3 כישלונות "לא נמצא mp4" ויציאה מהתור.
+        if not has_clip(job_dir, idx):
+            continue
         chosen.append((idx, seg))
 
     if not chosen:
@@ -141,7 +155,7 @@ def send_for_approval(job_dir: Path, min_score: int = 6, with_video: bool = True
     notify(f"<b>{display} — {len(chosen)} קטעים ממתינים לאישור</b>\n"
            f"מגיעה תצוגה מקדימה של הפתיחה. ✓ מאשר · ✗ דוחה ואשאל למה · "
            f"✎ משנה כותרת · 📼 שולח את כל הקליפ.\n"
-           f"<code>/pending</code> יראה תמיד מה עוד פתוח.")
+           f"<code>/pending</code> יראה תמיד מה עוד פתוח.", important=True)
 
     sent = 0
     for idx, seg in chosen:
