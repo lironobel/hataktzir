@@ -38,7 +38,7 @@ Scheduled upload queue (YouTube Data API v3, OAuth2, quota-aware), credit + link
 
 - **No manual editing.** A real 11.7-hour stream (29.9.2026) produced 11 candidate segments, 9 above the quality bar, 8 approved, 7 published. Stream end to first clip online: about 5 hours, on one home PC.
 - **Cost control.** Prompt caching, the Batch API for non-urgent videos (50% cheaper), and a budget controller with `realtime` / `batch` / `waiting_budget` modes under a fixed monthly cap. Model cost per stream is $0.2-2 depending on length; the 11.7-hour stream above cost $1.84.
-- **Quota-aware uploads.** A scheduled queue spreads uploads over the day within the YouTube API's 10,000-unit daily quota and puts time-sensitive clips first.
+- **Scheduled uploads.** A queue spreads uploads over the day at a configurable pace and puts time-sensitive clips first. It tracks the YouTube API limits (since September 2026: 100 uploads/day in their own bucket, plus 10,000 units for thumbnails, metadata fixes and checks).
 - **Fails loudly, not silently.** Partial failures (an untranscribed chunk, a window the model did not analyse, a clip that failed to cut) are recorded and reported instead of being treated as "no results".
 - **Runs unattended.** A monitor loop polls every 5 minutes, with a separate watchdog started by the OS scheduler.
 
