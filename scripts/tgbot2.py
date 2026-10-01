@@ -459,10 +459,26 @@ def send_full_clip(job: Path, idx: int) -> None:
 
 # ------------------------------------------------------ העלאה ליוטיוב (16)
 #
+# ⚠ מ-25.9 privacy=public ב-youtube.json: ✓ הוא האישור היחיד והסרטון עולה
+# ישר לאוויר. אין כפתור פרסום ואין תזכורת (upload.pending_publish מדלג על
+# public מ-30.9). מה שכתוב למטה חל רק אם מחזירים privacy=unlisted.
+#
 # ✓ לא מפרסם. הוא מעלה כ-unlisted ומחזיר קישור עם כפתור פרסום.
 # ההפרדה הזאת היא הבלם היחיד בצינור שכולו אוטומטי: הכותרת, התיאור
 # והתמנייל נבנים בלי אדם, ולכן חייבת להיות נקודה אחת שבה מסתכלים
 # על התוצאה לפני שהיא באוויר.
+
+def credit_note(res: dict) -> str:
+    """
+    30.9: משתתף בלי קישור ב-channels.json עולה בשם בלבד (לא עם סימון
+    "חסר קישור" בתיאור הציבורי). השורה הזאת אומרת את מי להשלים.
+    """
+    miss = res.get("credit_missing") or []
+    if not miss:
+        return ""
+    return ("\n⚠ קרדיט בלי קישור: " + ", ".join(miss[:6])
+            + " - למלא ב-channels.json")
+
 
 def publish_buttons(job_name: str, idx: int) -> list:
     return [[{"text": "🌍 פרסם עכשיו", "callback_data": f"pb:{job_name}:{idx}"}]]
@@ -520,7 +536,7 @@ def do_upload(job: Path, idx: int) -> None:
         left = 1
     if left <= 0:
         notify(f"<b>[{idx}] {title[:50]}</b>\n"
-               "המכסה היומית של יוטיוב נגמרה (6 העלאות ליום).\n"
+               "המכסה היומית של יוטיוב נגמרה (100 העלאות ליום).\n"
                "הקטע נשאר בתור ויעלה מחר לבד.")
         return
 
@@ -560,6 +576,7 @@ def do_upload(job: Path, idx: int) -> None:
 
     thumb = ("" if res.get("thumb_ok")
              else f"\n⚠ תמנייל לא עלה: {res.get('thumb_error','')[:120]}")
+    thumb += credit_note(res)
     if res.get("privacy") == "public":
         notify(f"{head}\n\nעלה ו<b>באוויר</b>.{thumb}", important=bool(thumb))
     else:
@@ -724,6 +741,7 @@ def queue_loop(stop: threading.Event = None) -> None:
         tail = f"\nנשארו בתור: {left}" if left else "\nהתור ריק עכשיו."
         thumb = ("" if res.get("thumb_ok")
                  else f"\n⚠ תמנייל לא עלה: {res.get('thumb_error','')[:120]}")
+        thumb += credit_note(res)
         # 25.9: לירון - ✓ הוא האישור היחיד. youtube.json privacy=public,
         # ואז הסרטון באוויר מיד ואין כפתור פרסום.
         live = res.get("privacy") == "public"
@@ -1434,6 +1452,33 @@ def kill_tree(pid: int) -> bool:
         return False
 
 
+_UNDER_MONITOR = False      # start_thread מסמן. רק אז יש bat שמעלה אותנו מחדש
+
+
+def reply_restart(arg: str = "") -> str:
+    """
+    30.9 (בקשת לירון): טעינה מחדש של הקוד בלי לגעת במחשב. התהליך של המנטר
+    יוצא, ו-start_monitor.bat (לולאת goto) מעלה אותו מחדש אחרי 60 שנ' עם
+    הקבצים שבדיסק. צינורות run10 רצים מנותקים - לא נפגעים.
+    לא יוצאים באמצע העלאה ליוטיוב (הקטע היה נשאר "בהעלאה" 3 שעות).
+    ה-offset של טלגרם נשמר לפני הטיפול בהודעה, כך ש-/restart לא יחזור בלולאה.
+    """
+    if not _UNDER_MONITOR:
+        return ("הבוט רץ כאן בלי המנטר (start_bot_only.bat), ואין מי שיעלה אותו מחדש. "
+                "לסגור את החלון ולהפעיל שוב ידנית.")
+    lock = getattr(yt_upload, "_UPLOAD_LOCK", None) if yt_upload else None
+    if lock is not None and lock.locked():
+        return "⏳ יש העלאה ליוטיוב באמצע. לא מפעיל מחדש עכשיו - לנסות שוב בעוד כמה דקות."
+    log("/restart: יוצא. start_monitor.bat יעלה את המנטר מחדש בעוד 60 שנ'.")
+
+    def _bye():
+        time.sleep(4)            # שהתשובה תספיק לצאת לטלגרם
+        os._exit(0)
+    threading.Thread(target=_bye, daemon=True, name="restart").start()
+    return ("🔄 <b>מפעיל מחדש</b> - המנטר והבוט עולים שוב בעוד כדקה וחצי, עם הקוד שבדיסק.\n"
+            "לוודא: <code>/health</code> אחרי שתי דקות.")
+
+
 def reply_pause(arg: str = "") -> str:
     """
     עצירת חירום (29.9, בקשת לירון): כשרואים תקלה עמוקה - לעצור הכל.
@@ -1502,6 +1547,7 @@ def reply_help() -> str:
         "<b>יוטיוב</b>\n"
         "<b>/queue</b> — תור ההעלאות ומתי כל אחד יעלה\n"
         "<b>/budget</b> — כמה הוצאנו החודש, והאם התקציב עוצר את הערוץ\n"
+        "<b>/restart</b> — לטעון מחדש את הקוד (המנטר והבוט, ~דקה וחצי)\n"
         "<b>/unlisted</b> — מה כבר למעלה ועוד לא באוויר\n"
         "<b>/upload שם מספר</b> — להעלות קטע ידנית\n"
         "<b>/publish שם מספר</b> — להעביר סרטון ל-public\n\n"
@@ -1542,6 +1588,8 @@ ROUTES = [
     # עצירת חירום - ראשונה, ובלי מילים קצרות שיופיעו סתם במשפט
     (("pause", "עצור הכל", "עצור הכול", "השהה הכל", "תעצור הכל"), reply_pause),
     (("resume", "המשך הכל", "תמשיך הכל", "חזור לפעולה"), reply_resume),
+    # רק המילה עצמה: "ריסטארט" בעברית היה נתפס גם בתוך "אל תעשה ריסטארט"
+    (("restart",), reply_restart),
     (("queue", "תור", "מה בתור", "תור ההעלאות", "מתי יעלה",
       "מה מחכה להעלאה"), reply_queue),
     (("budget", "תקציב", "כמה הוצאנו", "כמה עלה", "הוצאות"), reply_budget),
@@ -1682,6 +1730,7 @@ MENU_COMMANDS = [
     ("resend",  "לשלוח שוב את הקטעים הפתוחים"),
     ("queue",   "תור ההעלאות ומתי כל אחד יעלה"),
     ("budget",  "כמה הוצאנו החודש, והאם התקציב מגביל"),
+    ("restart", "לטעון מחדש את הקוד - המנטר והבוט"),
     ("unlisted", "מה למעלה ועוד לא באוויר"),
     ("upload",  "להעלות קטע ידנית - /upload שם מספר"),
     ("approve", "לאשר קטעים - /approve שם 1,3,5"),
@@ -1752,6 +1801,8 @@ def serve(once: bool = False, stop: threading.Event = None) -> None:
 
 def start_thread() -> threading.Thread:
     """מפעיל את הבוט כחוט רקע. משמש את המנטר."""
+    global _UNDER_MONITOR
+    _UNDER_MONITOR = True
     t = threading.Thread(target=serve, daemon=True, name="tgbot")
     t.start()
     return t
